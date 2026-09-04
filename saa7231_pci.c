@@ -1,7 +1,7 @@
 /*
  *	SAA7231xx PCI/PCI Express bridge driver
  *
- *	Copyright (C) Manu Abraham <abraham.manu@gmail.com>
+ *	Copyright (C) Allen Xu <45908351@qq.com>
  *
  *	This program is free software; you can redistribute it and/or modify
  *	it under the terms of the GNU General Public License as published by
@@ -441,5 +441,5 @@ void saa7231_pci_exit(struct saa7231_dev *saa7231)
 EXPORT_SYMBOL_GPL(saa7231_pci_exit);
 
 MODULE_DESCRIPTION("SAA7231 bridge driver");
-MODULE_AUTHOR("Manu Abraham");
+MODULE_AUTHOR("Allen Xu <45908351@qq.com>");
 MODULE_LICENSE("GPL");

@@ -4,7 +4,7 @@
 # as module parameters so we can sweep combinations at runtime.
 import io
 
-f = "/home/xxj/saa7231_debian/saa7231_drv.c"
+f = "/home/xxj/A328_D_Driver/saa7231_drv.c"
 t = io.open(f, encoding="utf-8").read()
 
 # ---- 1) extend module params ----

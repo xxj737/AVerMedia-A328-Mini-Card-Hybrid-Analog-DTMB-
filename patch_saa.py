@@ -5,7 +5,7 @@
 # re-write it after each tune.
 import sys
 
-f = "/home/xxj/saa7231_debian/saa7231_drv.c"
+f = "/home/xxj/A328_D_Driver/saa7231_drv.c"
 t = open(f, encoding="utf-8").read()
 
 def rep(old, new, tag):

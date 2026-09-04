@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """Disable YUAN MT2063 tuner mount in saa7231_drv.c (I2C deadlock fix)"""
 
-F = '/home/xxj/saa7231_debian/saa7231_drv.c'
+F = '/home/xxj/A328_D_Driver/saa7231_drv.c'
 t = open(F).read()
 
 old = '''\t\t/* tuner @ i2c-1:0x60 - identity TBD (not tda18271/tda18218,

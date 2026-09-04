@@ -1,7 +1,7 @@
 /*
  *	SAA7231xx PCI/PCI Express bridge driver
  *
- *	Copyright (C) Manu Abraham <abraham.manu@gmail.com>
+ *	Copyright (C) Allen Xu <45908351@qq.com>
  *
  *	This program is free software; you can redistribute it and/or modify
  *	it under the terms of the GNU General Public License as published by

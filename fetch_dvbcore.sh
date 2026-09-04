@@ -34,17 +34,17 @@ echo "== 提取 include/media 整个目录 =="
 rm -rf /tmp/dvbhdr && mkdir -p /tmp/dvbhdr
 tar xf "$SRC" -C /tmp/dvbhdr "$MEDIA_DIR"
 MEDIA_LOCAL=$(find /tmp/dvbhdr -path '*include/media' -type d | head -1)
-cp -r "$MEDIA_LOCAL"/* /home/xxj/saa7231_debian/include/media/
+cp -r "$MEDIA_LOCAL"/* /home/xxj/A328_D_Driver/include/media/
 echo "--- DVB 相关头文件: ---"
-ls -l /home/xxj/saa7231_debian/include/media/ | grep -E 'dvb|demux|dmxdev' || ls -l /home/xxj/saa7231_debian/include/media/ | head
+ls -l /home/xxj/A328_D_Driver/include/media/ | grep -E 'dvb|demux|dmxdev' || ls -l /home/xxj/A328_D_Driver/include/media/ | head
 
 echo
 echo "== 复制 DVB 头到驱动源码根目录 (双引号 include 直接命中) =="
-DEST=/home/xxj/saa7231_debian
+DEST=/home/xxj/A328_D_Driver
 for h in dvbdev.h dvb_frontend.h dvb_demux.h demux.h dmxdev.h dvb_net.h \
          dvb_ca_en50221.h dvb_math.h dvb_ringbuffer.h dvb_vb2.h \
          dvb-usb-ids.h videobuf2-dvb.h; do
-  [ -f "/home/xxj/saa7231_debian/include/media/$h" ] && cp "/home/xxj/saa7231_debian/include/media/$h" "$DEST/"
+  [ -f "/home/xxj/A328_D_Driver/include/media/$h" ] && cp "/home/xxj/A328_D_Driver/include/media/$h" "$DEST/"
 done
 ls -l "$DEST"/dvb*.h "$DEST"/demux.h "$DEST"/dmxdev.h 2>/dev/null
 

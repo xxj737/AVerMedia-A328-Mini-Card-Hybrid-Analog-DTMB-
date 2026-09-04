@@ -4,7 +4,7 @@
 # front-end chips; verified: pulling them low kills TDA18271 on i2c-2).
 import io
 
-f = "/home/xxj/saa7231_debian/saa7231_drv.c"
+f = "/home/xxj/A328_D_Driver/saa7231_drv.c"
 t = io.open(f, encoding="utf-8").read()
 
 old = """\tcase SUBSYS_INFO(AVERMEDIA_TECHNOLOGY, AVERMEDIA_A328_DTMB):

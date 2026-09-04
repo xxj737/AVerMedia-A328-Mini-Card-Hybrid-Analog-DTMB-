@@ -25,7 +25,7 @@
 
 ### 1. 传代码 (在 Windows PowerShell)
 ```
-scp -r "C:\Users\许小军\Doubao\chats\2026-08-29\new-chat\saa7231_re\saa7231_debian" xxj@192.168.10.154:/home/xxj/A328_D_Driver
+scp -r "C:\Users\xxj\Doubao\chats\2026-08-29\new-chat\saa7231_re\saa7231_debian" xxj@192.168.10.154:/home/xxj/A328_D_Driver
 ```
 
 ### 2. 环境诊断

@@ -1,0 +1,2279 @@
+﻿/*
+ *	SAA7231xx PCI/PCI Express bridge driver
+ *
+ *	Copyright (C) Manu Abraham <abraham.manu@gmail.com>
+ *
+ *	This program is free software; you can redistribute it and/or modify
+ *	it under the terms of the GNU General Public License as published by
+ *	the Free Software Foundation; either version 2 of the License, or
+ *	(at your option) any later version.
+ *
+ *	This program is distributed in the hope that it will be useful,
+ *	but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *	MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *	GNU General Public License for more details.
+ *
+ *	You should have received a copy of the GNU General Public License
+ *	along with this program; if not, write to the Free Software
+ *	Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+ */
+
+#include <linux/module.h>
+#include <linux/moduleparam.h>
+#include <linux/kernel.h>
+#include <linux/pci.h>
+#include <linux/mutex.h>
+
+#include <asm/irq.h>
+#include <linux/signal.h>
+#include <linux/sched.h>
+#include <linux/interrupt.h>
+#include <linux/i2c.h>
+
+#include <asm/io.h>
+#include <asm/pgtable.h>
+#include <asm/page.h>
+#include <linux/kmod.h>
+#include <linux/vmalloc.h>
+#include <linux/init.h>
+#include <linux/device.h>
+#include <linux/delay.h>
+
+#include <linux/dvb/video.h>
+#include <linux/dvb/audio.h>
+#include <linux/dvb/osd.h>
+
+#include "dvbdev.h"
+#include "dvb_demux.h"
+#include "dmxdev.h"
+#include "dvb_frontend.h"
+#include "dvb_net.h"
+#include "dvb_ca_en50221.h"
+
+#if 0 /* v4l2/video parts are disabled in this build */
+#include <linux/videodev2.h>
+#include <media/v4l2-common.h>
+#include <media/v4l2-ioctl.h>
+#endif
+
+#include "saa7231_mod.h"
+#include "saa7231_priv.h"
+
+/* AVerMedia A328 frontend: Legend Silicon LGS8G75 DTMB demod +
+ * NXP TDA18271HD/C2 silicon tuner (headers copied from linux-5.10
+ * source; the .ko modules ship with the Debian kernel). */
+#include "lgs8gxx.h"
+#include "tda18271.h"
+#include "rtl2836.h"
+#include "mt2063.h"
+#include "saa7231_dvb.h"
+#include "saa7231_cgu.h"
+#include "saa7231_cgu_reg.h"
+#include "saa7231_if.h"
+#include "saa7231_i2c.h"
+#include "saa7231_msi_reg.h"
+#include "saa7231_dcs_reg.h"
+#include "saa7231_msi.h"
+#include "saa7231_gpio_reg.h"
+#include "saa7231_gpio.h"
+//#include "saa7231_vs2dtl.h"
+//#include "saa7231_vidops.h"
+//#include "saa7231_audops.h"
+//#include "saa7231_aico_reg.h"
+
+//#include "saa7231_dvbs.h"
+//#include "saa7231_dvbt.h"
+
+/*
+ * Frontend attach: the upstream driver only knows the BlackGold/NXP reference
+ * boards.  The AverMedia A328 uses a Legend LGS8G75 (DTMB) demod + NXP TDA18271
+ * tuner, which is NOT among them.  To keep the bridge core buildable without any
+ * dvb-frontend symbol dependency (and to compile against stock 5.10 which lacks
+ * cxd2850/cxd2817/cxd2861), the non-relevant frontend code is disabled here.
+ *
+ * The A328 frontend attach (lgs8gxx + tda18271) is added in saa7231_drv_a328.c
+ * and wired below via the a328-specific config in saa7231_a328.c.
+ */
+#if 0
+#include "stv6110x.h"
+#include "stv090x.h"
+#include "lnbh24.h"
+#include "tda10048.h"
+#include "tda18271.h"
+#include "s5h1411.h"
+#include "tda18272.h"
+#include "cxd2820r.h"
+//#include "cxd2834.h"
+#include "cxd2850.h"
+#include "a8290.h"
+#include "cxd2817.h"
+#include "cxd2861.h"
+#endif
+
+static unsigned int verbose = 3;	/* kernel5.10: default on, so probe errors are visible */
+static unsigned int int_type;
+
+module_param(verbose, int, 0644);
+module_param(int_type, int, 0644);
+
+MODULE_PARM_DESC(verbose, "verbose startup messages, default is 1 (yes)");
+MODULE_PARM_DESC(int_type, "force Interrupt Handler type: 0=INT-A, 1=MSI, 2=MSI-X. default INT-A mode");
+
+#define DRIVER_NAME				"SAA7231"
+#define DRIVER_VER				"0.0.91"
+#define MODULE_DBG				(((saa7231)->verbose == SAA7231_DEBUG) ? 1 : 0)
+
+extern void saa7231_dump_write(struct saa7231_dev *saa7231);
+
+static unsigned int num;
+
+#define STV090x_CFGUPDATE(__config, __ctl) {				\
+	(__config)->tuner_init		= (__ctl)->tuner_init;		\
+	(__config)->tuner_set_mode	= (__ctl)->tuner_set_mode;	\
+	(__config)->tuner_set_frequency	= (__ctl)->tuner_set_frequency;	\
+	(__config)->tuner_get_frequency	= (__ctl)->tuner_get_frequency;	\
+	(__config)->tuner_set_bandwidth	= (__ctl)->tuner_set_bandwidth;	\
+	(__config)->tuner_get_bandwidth	= (__ctl)->tuner_get_bandwidth;	\
+	(__config)->tuner_set_bbgain	= (__ctl)->tuner_set_bbgain;	\
+	(__config)->tuner_get_bbgain	= (__ctl)->tuner_get_bbgain;	\
+	(__config)->tuner_set_refclk	= (__ctl)->tuner_set_refclk;	\
+	(__config)->tuner_get_status	= (__ctl)->tuner_get_status;	\
+}
+
+static int saa7231_gpio_reset(struct saa7231_dev *saa7231, enum saa7231_gpio gpio, int delay)
+{
+	if (saa7231_gpio_set(saa7231, gpio, 0) < 0)
+		return -EIO;
+	msleep(delay);
+	if (saa7231_gpio_set(saa7231, gpio, 1) < 0)
+		return -EIO;
+	msleep(delay);
+
+	return 0;
+}
+
+/* ---- GPIO sysfs debug: probe which GPIO powers the frontend ----
+ *   cat   <pci>/gpio_ctl          -> show PINS/MODE0/MODE1
+ *   echo "N out"  > gpio_ctl      -> configure bit N as output (N=0..7)
+ *   echo "N hi"   > gpio_ctl      -> output high
+ *   echo "N lo"   > gpio_ctl      -> output low
+ *   echo "N pulse"> gpio_ctl      -> low 50ms then high (reset pulse)
+ */
+static ssize_t saa7231_gpio_ctl_show(struct device *dev,
+				     struct device_attribute *attr, char *buf)
+{
+	struct saa7231_dev *saa7231 = pci_get_drvdata(to_pci_dev(dev));
+	u32 pins, mode0, mode1;
+
+	if (!saa7231 || !saa7231->mmio1)
+		return -ENODEV;
+	pins  = SAA7231_RD(SAA7231_BAR0, GPIO, FB0_PINS);
+	mode0 = SAA7231_RD(SAA7231_BAR0, GPIO, FB0_MODE0);
+	mode1 = SAA7231_RD(SAA7231_BAR0, GPIO, FB0_MODE1);
+	return sprintf(buf, "PINS=0x%08X MODE0=0x%08X MODE1=0x%08X\n",
+		       pins, mode0, mode1);
+}
+
+static ssize_t saa7231_gpio_ctl_store(struct device *dev,
+				      struct device_attribute *attr,
+				      const char *buf, size_t count)
+{
+	struct saa7231_dev *saa7231 = pci_get_drvdata(to_pci_dev(dev));
+	int bit = -1;
+	char action[8] = {0};
+	u32 gpio;
+
+	if (!saa7231 || !saa7231->mmio1)
+		return -ENODEV;
+	if (sscanf(buf, "%d %7s", &bit, action) != 2 || bit < 0 || bit > 7)
+		return -EINVAL;
+	gpio = (1u << bit);
+
+	if (!strcmp(action, "out")) {
+		SAA7231_WR(gpio, SAA7231_BAR0, GPIO, FB0_MODE1_SET);
+	} else if (!strcmp(action, "hi")) {
+		SAA7231_WR(gpio, SAA7231_BAR0, GPIO, FB0_MODE1_SET);
+		SAA7231_WR(gpio, SAA7231_BAR0, GPIO, FB0_MODE0_SET);
+	} else if (!strcmp(action, "lo")) {
+		SAA7231_WR(gpio, SAA7231_BAR0, GPIO, FB0_MODE1_SET);
+		SAA7231_WR(gpio, SAA7231_BAR0, GPIO, FB0_MODE0_RESET);
+	} else if (!strcmp(action, "pulse")) {
+		SAA7231_WR(gpio, SAA7231_BAR0, GPIO, FB0_MODE1_SET);
+		SAA7231_WR(gpio, SAA7231_BAR0, GPIO, FB0_MODE0_RESET);
+		msleep(50);
+		SAA7231_WR(gpio, SAA7231_BAR0, GPIO, FB0_MODE0_SET);
+		msleep(50);
+	} else {
+		return -EINVAL;
+	}
+	dev_info(&saa7231->pdev->dev, "gpio_ctl bit%d %s done\n", bit, action);
+	return count;
+}
+static DEVICE_ATTR(gpio_ctl, 0644, saa7231_gpio_ctl_show, saa7231_gpio_ctl_store);
+/* ---- BSL firmware loader ----
+ * The SAA7231 needs its BSL firmware (11317231_<subsys>_aa.bin / DMBT.bin)
+ * pushed through the PCI BAR before the on-die CPU starts.  The Windows driver
+ * (AVer7231_x64.sys) does this automatically; the Linux driver never did, which
+ * is why the LGS8G75/TDA18271 frontend never shows up on the I2C bus.
+ * These arrays come from the AverMedia A328 / YUAN MC163ML driver packages.
+ *
+ *   cat   <pci>/bsl_load                  -> usage
+ *   echo "scan" > bsl_load                -> try every candidate offset (data@0x0D)
+ *   echo "scanfull" > bsl_load            -> try every candidate offset (full, incl START)
+ *   echo "<off>" > bsl_load               -> write at BAR0+<off> (data@0x0D)
+ *   echo "<off> full" > bsl_load          -> write full image at BAR0+<off>
+ *   echo "<off> start" > bsl_load         -> write "START"+header first, then data
+ * After loading run: i2cdetect -y -r 8    (frontend 0x1c/0x1e, tuner 0x60/0x61)
+ */
+static const unsigned char saa7231_bsl_8323[461] = {
+    0x53, 0x54, 0x41, 0x52, 0x54, 0x08, 0x00, 0x00, 0x01, 0x8C, 0x01, 0x05,
+    0x72, 0x10, 0x00, 0xFF, 0xFF, 0x02, 0x00, 0x01, 0x00, 0x31, 0x72, 0x00,
+    0xFF, 0x01, 0x00, 0x9A, 0x00, 0x00, 0x04, 0x5D, 0x00, 0x24, 0xFF, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xD7, 0xFF,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x02, 0x70,
+    0x70, 0x00, 0x00, 0x00, 0xE2, 0x17, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+    0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x20, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00,
+    0x00, 0x04, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+    0x00, 0x10, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00,
+    0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x41, 0x00, 0x00, 0x00, 0x11, 0x00, 0x00, 0x00, 0x01, 0x10, 0x00, 0x00,
+    0x31, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x10, 0x02, 0x00, 0x05, 0x3D, 0x02, 0x00, 0x00,
+    0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x7E, 0x00, 0x00, 0x02, 0x00, 0x0C,
+    0x00, 0xFF, 0xFF, 0x04, 0x01, 0x01, 0xFF, 0x00, 0x00, 0x00, 0x48, 0xE2,
+    0x17, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20,
+    0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+    0x04, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x10, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04,
+    0x06, 0x03, 0x10, 0x10, 0x00, 0x02, 0x04, 0x38, 0x00, 0x49, 0x66, 0xDA,
+    0x4B, 0x68, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x00, 0x21, 0x00, 0xCC,
+    0x01, 0x00, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x0F,
+    0x02, 0x5C, 0x00, 0x10, 0x03, 0x00, 0x02, 0x40, 0x00, 0x00, 0x00, 0x48,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x04, 0x00, 0xC0, 0x02, 0x02, 0x02, 0x03,
+    0x10, 0x04, 0x00, 0x05, 0x80, 0x00, 0x00, 0x00, 0x48, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x0A, 0x00, 0x00, 0x02, 0x08, 0x00, 0x00, 0x00, 0x20, 0x00,
+    0x00, 0x00, 0x04, 0x10, 0x05, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x48,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x11, 0x00, 0x32, 0x03, 0x0A, 0x0E, 0x00,
+    0x00, 0x00, 0x02, 0x01, 0x00, 0x00, 0x01, 0x86, 0x04, 0x01, 0x05, 0x01,
+    0x00, 0x00, 0x01, 0x00, 0x11, 0x00, 0x32, 0x03, 0x0A, 0x0E, 0x00, 0x00,
+    0x00, 0x02, 0x01, 0x00, 0x00, 0x01, 0x06, 0x04, 0x01, 0x05, 0x01, 0x00,
+    0x10, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x48, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x02, 0x00, 0x34, 0x02, 0x00, 0x01, 0x00, 0x01, 0x00, 0x03,
+    0x00, 0x00, 0x03, 0x08, 0x00,
+};
+
+static const unsigned char saa7231_bsl_dmbt[502] = {
+    0x53, 0x54, 0x41, 0x52, 0x54, 0x08, 0x00, 0x00, 0x01, 0x8E, 0x01, 0x05,
+    0x0C, 0x10, 0x00, 0xFF, 0xFF, 0x02, 0x00, 0x01, 0x00, 0x31, 0x72, 0x00,
+    0xFF, 0x01, 0x00, 0x9A, 0x00, 0x00, 0x04, 0x5D, 0x00, 0x24, 0x3D, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC2, 0xFF,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xF7, 0xFF,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x02, 0x70,
+    0x70, 0x00, 0x00, 0x00, 0xE3, 0x17, 0x11, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x20, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00,
+    0x00, 0x04, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+    0x00, 0x10, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00,
+    0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x11, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x11, 0x00, 0x00, 0x00,
+    0x11, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x03, 0xE4, 0x03, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x10, 0x02, 0x00, 0x05, 0x3D, 0x02, 0x00, 0x00,
+    0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x84, 0x00, 0x00, 0x02, 0x00, 0x0C,
+    0x00, 0xFF, 0xFF, 0x04, 0x01, 0x01, 0xFF, 0x00, 0x00, 0x00, 0x48, 0xE3,
+    0x17, 0x11, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20,
+    0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+    0x04, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x10, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00,
+    0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04,
+    0x06, 0x03, 0x10, 0x10, 0x00, 0x02, 0x04, 0x38, 0x00, 0x49, 0x66, 0xDA,
+    0x4B, 0x68, 0x00, 0x03, 0x78, 0x00, 0x00, 0x06, 0x00, 0x21, 0x00, 0xCC,
+    0x01, 0x00, 0x04, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x02, 0x01,
+    0x07, 0x03, 0x03, 0x04, 0x00, 0x0F, 0x02, 0x5C, 0x00, 0x10, 0x03, 0x00,
+    0x01, 0x40, 0x00, 0x00, 0x00, 0x48, 0x00, 0x00, 0x00, 0x01, 0x00, 0x03,
+    0x00, 0xC0, 0x02, 0x01, 0x10, 0x10, 0x04, 0x00, 0x05, 0x80, 0x00, 0x00,
+    0x00, 0x48, 0x00, 0x00, 0x00, 0x01, 0x00, 0x0A, 0x00, 0x00, 0x02, 0x08,
+    0x00, 0x00, 0x00, 0x30, 0x00, 0x00, 0x00, 0x04, 0x10, 0x05, 0x00, 0x05,
+    0x00, 0x01, 0x00, 0x00, 0x48, 0x00, 0x00, 0x00, 0x01, 0x00, 0x0E, 0x00,
+    0x00, 0x03, 0x0A, 0x0B, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x03,
+    0xFF, 0x04, 0x00, 0x00, 0x00, 0x48, 0x00, 0x00, 0x00, 0x01, 0x00, 0x0E,
+    0x00, 0x32, 0x03, 0x0A, 0x0B, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x02, 0x05, 0x84, 0x00, 0x10, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40,
+    0x48, 0x00, 0x00, 0x00, 0x01, 0x00, 0x02, 0x00, 0x34, 0x02, 0x00, 0x00,
+    0x00, 0x01, 0x00, 0x00, 0x48, 0x00, 0x00, 0x00, 0x01, 0x00, 0x0E, 0x00,
+    0x32, 0x03, 0x0A, 0x0B, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02,
+    0x05, 0x84, 0x00, 0x10, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x48,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x02, 0x00, 0x34, 0x02, 0x00,
+};
+
+
+#define BSL_START_LEN  13   /* "START" + 8-byte header = 0x0D */
+static const u32 saa7231_bsl_candidates[] = {
+	0x000000, 0x000100, 0x000400, 0x001000, 0x004000,
+	0x010000, 0x040000, 0x080000, 0x0C0000, 0x100000,
+	0x101000, 0x104000, 0x108000, 0x110000, 0x140000,
+	0x180000, 0x200000, 0x240000, 0x280000, 0x2C0000,
+	0x2F0000, 0x300000, 0x340000, 0x380000, 0x3C0000,
+	0x3F0000, 0x3FF000, 0x3FFC00
+};
+#define N_BSL_CAND (sizeof(saa7231_bsl_candidates)/sizeof(saa7231_bsl_candidates[0]))
+
+static const unsigned char *saa7231_bsl_fw(struct saa7231_dev *saa7231, size_t *len)
+{
+	if (saa7231->pdev->subsystem_vendor == 0x12ab) {
+		*len = sizeof(saa7231_bsl_dmbt);
+		return saa7231_bsl_dmbt;
+	}
+	*len = sizeof(saa7231_bsl_8323);
+	return saa7231_bsl_8323;
+}
+
+static ssize_t saa7231_bsl_load_show(struct device *dev,
+				     struct device_attribute *attr, char *buf)
+{
+	return sprintf(buf, "usage: echo scan|scanfull|<off> [full|start] > bsl_load\n"
+			    "       then: i2cdetect -y -r 8\n");
+}
+
+static void saa7231_bsl_write(struct saa7231_dev *saa7231, void __iomem *mmio,
+			      u32 off, const unsigned char *fw, size_t fw_len, int mode)
+{
+	u32 pre, post;
+	const char *tag = (mmio == saa7231->mmio1) ? "" : "[BAR2]";
+
+	pre = readl(mmio + off);
+	if (mode == 2) {	/* START magic first, then rest */
+		memcpy_toio(mmio + off, fw, BSL_START_LEN);
+		msleep(20);
+		memcpy_toio(mmio + off + BSL_START_LEN,
+			    fw + BSL_START_LEN, fw_len - BSL_START_LEN);
+	} else if (mode == 3) {	/* dword-wise write: try write order */
+		size_t i, n = (fw_len - BSL_START_LEN) / 4;
+		const u32 *p = (const u32 *)(fw + BSL_START_LEN);
+		for (i = 0; i < n; i++)
+			writel(p[i], mmio + off + i * 4);
+	} else {
+		memcpy_toio(mmio + off, fw, fw_len);
+	}
+	msleep(200);
+	post = readl(mmio + off);
+	dev_info(&saa7231->pdev->dev,
+		 "BSL%s off=0x%X len=%zu mode=%d pre=0x%08X post=0x%08X %s\n",
+		 tag, off, fw_len, mode, pre, post, (post != pre) ? "CHANGED" : "same");
+}
+
+static ssize_t saa7231_bsl_load_store(struct device *dev,
+				      struct device_attribute *attr,
+				      const char *buf, size_t count)
+{
+	struct saa7231_dev *saa7231 = pci_get_drvdata(to_pci_dev(dev));
+	const unsigned char *fw;
+	size_t fw_len;
+	char cmd[16] = {0}, opt[8] = {0};
+	u32 off = 0;
+	int mode = 0, i, bar = 0;
+	void __iomem *mmio;
+
+	if (!saa7231 || !saa7231->mmio1)
+		return -ENODEV;
+
+	fw = saa7231_bsl_fw(saa7231, &fw_len);
+	if (sscanf(buf, "%15s %7s", cmd, opt) < 1)
+		return -EINVAL;
+
+	if (!strcmp(opt, "full"))
+		mode = 1;
+	else if (!strcmp(opt, "start"))
+		mode = 2;
+	else if (!strcmp(opt, "dw"))
+		mode = 3;
+	else if (!strcmp(opt, "2"))	/* write to BAR2 */
+		bar = 2;
+
+	mmio = saa7231->mmio1;
+	if (bar == 2) {
+		mmio = pci_iomap(saa7231->pdev, 2, 0x400000);
+		if (!mmio) {
+			dev_err(&saa7231->pdev->dev, "BSL: BAR2 map failed\n");
+			return -ENOMEM;
+		}
+	}
+
+	if (!strcmp(cmd, "scan") || !strcmp(cmd, "scan2")) {
+		for (i = 0; i < N_BSL_CAND; i++)
+			saa7231_bsl_write(saa7231, mmio, saa7231_bsl_candidates[i],
+					  fw + BSL_START_LEN, fw_len - BSL_START_LEN, 0);
+		goto out;
+	}
+	if (!strcmp(cmd, "scanfull")) {
+		for (i = 0; i < N_BSL_CAND; i++)
+			saa7231_bsl_write(saa7231, mmio, saa7231_bsl_candidates[i], fw, fw_len, mode);
+		goto out;
+	}
+
+	if (kstrtou32(cmd, 0, &off)) {
+		dev_info(&saa7231->pdev->dev, "bsl_load: bad cmd '%s'\n", cmd);
+		goto out;
+	}
+	if (mode)
+		saa7231_bsl_write(saa7231, mmio, off, fw, fw_len, mode);
+	else
+		saa7231_bsl_write(saa7231, mmio, off, fw + BSL_START_LEN,
+				  fw_len - BSL_START_LEN, 0);
+out:
+	if (bar == 2)
+		pci_iounmap(saa7231->pdev, mmio);
+	return count;
+}
+static DEVICE_ATTR(bsl_load, 0644, saa7231_bsl_load_show, saa7231_bsl_load_store);
+
+/* ---- BSL autoload --------------------------------------------------------
+ * With a single card the SAA7231 ROM self-bootstraps its embedded 8051;
+ * with two (or more) cards present the ROM does NOT auto-load and the CPU
+ * never runs (0x4000 holds garbage, RGU stays dirty).  Detect the missing
+ * "STAR" magic and push the built-in BSL image using the same sequence as
+ * "echo 0x4000 start > bsl_load" (mode 2: START magic first, then payload).
+ * Must run before dvb_init() so the LGS8G75/TDA18271 attach sees a live CPU.
+ */
+static int saa7231_bsl_autoload(struct saa7231_dev *saa7231)
+{
+	const unsigned char *fw;
+	void __iomem *mmio;
+	size_t fw_len;
+	u32 magic;
+	const u32 STAR = 0x52415453;	/* "STAR" as read via readl (LE) */
+
+	if (!saa7231 || !saa7231->mmio1)
+		return -EINVAL;
+
+	mmio = saa7231->mmio1;
+	magic = readl(mmio + 0x4000);
+	if (magic == STAR) {	/* "STAR" already resident */
+		dev_info(&saa7231->pdev->dev,
+			 "BSL autoload: CPU already running (0x4000=\"STAR\"), skip\n");
+		return 0;
+	}
+
+	fw = saa7231_bsl_fw(saa7231, &fw_len);
+	dev_info(&saa7231->pdev->dev,
+		 "BSL autoload: 0x4000=0x%08X (no STAR), loading %zu-byte image...\n",
+		 magic, fw_len);
+
+	/* same sequence as "echo 0x4000 start > bsl_load" (mode 2) */
+	memcpy_toio(mmio + 0x4000, fw, BSL_START_LEN);
+	msleep(20);
+	memcpy_toio(mmio + 0x4000 + BSL_START_LEN,
+		    fw + BSL_START_LEN, fw_len - BSL_START_LEN);
+	msleep(1000);	/* let the 8051 boot & self-init (RGU auto-clear) */
+
+	magic = readl(mmio + 0x4000);
+	if (magic == STAR) {
+		dev_info(&saa7231->pdev->dev,
+			 "BSL autoload: OK, 0x4000=\"STAR\" after load\n");
+		return 0;
+	}
+	dev_warn(&saa7231->pdev->dev,
+		 "BSL autoload: wrote image but 0x4000=0x%08X (not STAR)\n", magic);
+	return -EIO;
+}
+
+/* ---- BAR dump sysfs: read any BAR0/BAR2 offset (dword) for diagnosis ----
+ *   echo "0 0x100 16" > bar_dump    -> BAR0 offset 0x100, 16 dwords
+ *   echo "2 0x0 16"   > bar_dump    -> BAR2 offset 0x0, 16 dwords
+ * Output goes to dmesg (root only).
+ */
+static ssize_t saa7231_bar_dump_show(struct device *dev,
+				     struct device_attribute *attr, char *buf)
+{
+	return sprintf(buf, "usage: echo \"<bar 0|2> <off-hex> [ndwords]\" > bar_dump\n"
+			    "       (dwords printed to dmesg)\n");
+}
+
+static ssize_t saa7231_bar_dump_store(struct device *dev,
+				      struct device_attribute *attr,
+				      const char *buf, size_t count)
+{
+	struct saa7231_dev *saa7231 = pci_get_drvdata(to_pci_dev(dev));
+	int bar = 0, n = 16, i;
+	u32 off = 0;
+	void __iomem *mmio;
+	char out[1600];
+	int o = 0;
+
+	if (!saa7231)
+		return -ENODEV;
+	if (sscanf(buf, "%d %x %d", &bar, &off, &n) < 2)
+		return -EINVAL;
+	if (n > 64)
+		n = 64;
+
+	mmio = saa7231->mmio1;
+	if (bar == 2) {
+		mmio = pci_iomap(saa7231->pdev, 2, 0x400000);
+		if (!mmio) {
+			dev_err(&saa7231->pdev->dev, "BAR dump: BAR2 map failed\n");
+			return -ENOMEM;
+		}
+	} else if (!mmio) {
+		return -ENODEV;
+	}
+
+	for (i = 0; i < n; i++) {
+		u32 v = readl(mmio + off + i * 4);
+		o += sprintf(out + o, "%04X: %08X%s",
+			     (u32)(off + i * 4), v,
+			     (i % 4 == 3) ? "\n" : "  ");
+	}
+	dev_info(&saa7231->pdev->dev, "BAR%d dump @0x%X (%d dw):\n%s",
+		 bar, off, n, out);
+	if (bar == 2)
+		pci_iounmap(saa7231->pdev, mmio);
+	return count;
+}
+static DEVICE_ATTR(bar_dump, 0644, saa7231_bar_dump_show, saa7231_bar_dump_store);
+
+/* ---- reg_write sysfs: write any BAR0/BAR2 dword for diagnosis ----
+ *   echo "0 0x10e100 0x00000000" > reg_write   -> BAR0 offset 0x10e100 = 0
+ *   echo "2 0x0 0x12345678"        > reg_write   -> BAR2 offset 0x0 = 0x12345678
+ */
+static ssize_t saa7231_reg_write_show(struct device *dev,
+				       struct device_attribute *attr, char *buf)
+{
+	return sprintf(buf, "usage: echo \"<bar 0|2> <off-hex> <val-hex>\" > reg_write\n");
+}
+
+static ssize_t saa7231_reg_write_store(struct device *dev,
+					struct device_attribute *attr,
+					const char *buf, size_t count)
+{
+	struct saa7231_dev *saa7231 = pci_get_drvdata(to_pci_dev(dev));
+	int bar = 0;
+	u32 off = 0, val = 0;
+	void __iomem *mmio;
+
+	if (!saa7231)
+		return -ENODEV;
+	if (sscanf(buf, "%d %x %x", &bar, &off, &val) < 3)
+		return -EINVAL;
+
+	mmio = saa7231->mmio1;
+	if (bar == 2) {
+		mmio = pci_iomap(saa7231->pdev, 2, 0x400000);
+		if (!mmio)
+			return -ENOMEM;
+	} else if (!mmio) {
+		return -ENODEV;
+	}
+
+	writel(val, mmio + off);
+	dev_info(&saa7231->pdev->dev, "reg_write BAR%d @0x%X = 0x%08X (readback=0x%08X)\n",
+		 bar, off, val, readl(mmio + off));
+
+	if (bar == 2)
+		pci_iounmap(saa7231->pdev, mmio);
+	return count;
+}
+static DEVICE_ATTR(reg_write, 0644, saa7231_reg_write_show, saa7231_reg_write_store);
+
+#define SAA7231_IRQNONE(__status)	(!(__status[0]	| \
+					   __status[1]	| \
+					   __status[2]	| \
+					   __status[3]))
+
+#define SAA7231_UNPLUGD(__status)	((__status[0] == 0xffffffff)	&& \
+					 (__status[1] == 0xffffffff)	&& \
+					 (__status[2] == 0xffffffff)	&& \
+					 (__status[3] == 0xffffffff))
+
+static irqreturn_t saa7231_irq_handler(int irq, void *dev_id)
+{
+	struct saa7231_dev *saa7231 = (struct saa7231_dev *) dev_id;
+	struct saa7231_irq_entry *event;
+
+	u32 dcs_stat, dcs_addr, status[4];
+	int i, j, vector = 0;
+
+	if (unlikely(!saa7231)) {
+		printk("%s: bgt7231=NULL\n", __func__);
+		return IRQ_NONE;
+	}
+
+	for (i = 0; i < SAA7231_MSI_LOOPS; i++)
+		status[i] = SAA7231_RD(SAA7231_BAR0, MSI, MSI_INT_STATUS(i));
+
+	if (SAA7231_IRQNONE(status))
+		return IRQ_NONE;
+
+	if (SAA7231_UNPLUGD(status))
+		return IRQ_NONE;
+
+	for (i = 0; i < SAA7231_MSI_LOOPS; i++) {
+
+		for (j = 0; j < 32; j++) {
+			irq = status[i] >> j;
+			if (irq & 0x1) {
+				vector = (i * 32) + j;
+				event = &saa7231->event_handler[vector];
+
+				SAA7231_WR(status[i], SAA7231_BAR0, MSI, MSI_INT_STATUS_CLR(i));
+				if (status[1] & 0x100000) {
+
+					dcs_stat = SAA7231_RD(SAA7231_BAR0, DCSN, DCSN_INT_STATUS);
+					dcs_addr = SAA7231_RD(SAA7231_BAR0, DCSN, DCSN_ADDR);
+					dprintk(SAA7231_DEBUG, 1, "Clearing access violation (0x%x) @0x%x...", dcs_stat, dcs_addr);
+
+					SAA7231_WR(dcs_stat, SAA7231_BAR0, DCSN, DCSN_INT_CLR_STATUS);
+					status[1] &= ~ 0x100000;
+				}
+
+				if (event->vector == vector)
+					event->handler(saa7231, vector);
+			}
+		}
+	}
+
+	return IRQ_HANDLED;
+}
+
+
+static int saa7231_pci_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
+{
+	struct saa7231_dev *saa7231;
+	int err = 0;
+
+	saa7231 = kzalloc(sizeof (struct saa7231_dev), GFP_KERNEL);
+	if (!saa7231) {
+		printk(KERN_ERR "saa7231_hybrid_pci_probe ERROR: out of memory\n");
+		err = -ENOMEM;
+		goto fail0;
+	}
+
+	saa7231->num		= num;
+	saa7231->verbose	= verbose;
+
+	saa7231->int_type	= int_type;
+	saa7231->pdev		= pdev;
+	saa7231->config		= (struct saa7231_config *) pci_id->driver_data;
+
+	strcpy(saa7231->ver, DRIVER_VER);
+
+	err = saa7231_pci_init(saa7231);
+	if (err) {
+		dprintk(SAA7231_ERROR, 1, "SAA7231 PCI Initialization failed, err=%d", err);
+		goto fail1;
+	}
+
+	err = saa7231_cgu_init(saa7231);
+	if (err) {
+		dprintk(SAA7231_ERROR, 1, "SAA7231 CGU Init failed, err=%d", err);
+		goto fail2;
+	}
+
+	err = saa7231_msi_init(saa7231);
+	if (err) {
+		dprintk(SAA7231_ERROR, 1, "SAA7231 MSI Init failed, err=%d", err);
+		goto fail3;
+	}
+
+	err = saa7231_i2c_init(saa7231);
+	if (err) {
+		dprintk(SAA7231_ERROR, 1, "SAA7231 I2C Initialization failed, err=%d", err);
+		goto fail4;
+	}
+
+	/* multi-card boards: ROM does not self-bootstrap the 8051, load BSL now */
+	saa7231_bsl_autoload(saa7231);
+
+	err = saa7231_if_init(saa7231);
+	if (err) {
+		dprintk(SAA7231_ERROR, 1, "SAA7231 IF Initialization failed, err=%d", err);
+		goto fail4;
+	}
+#if 0
+	err = saa7231_vfl_init(saa7231);
+	if (err) {
+		dprintk(SAA7231_ERROR, 1, "SAA7231 VFL initialization failed, err=%d", err);
+		goto fail6;
+	}
+#endif
+#if 1
+	err = saa7231_dvb_init(saa7231);
+	if (err) {
+		dprintk(SAA7231_ERROR, 1, "SAA7231 DVB initialization failed, err=%d", err);
+		goto fail5;
+	}
+#endif
+
+#if 0
+	err = saa7231_alsa_init(saa7231);
+	if (err) {
+		dprintk(SAA7231_ERROR, 1, "SAA7231 ALSA initializaton failed, err=%d", err);
+		goto fail7;
+	}
+#endif
+	dprintk(SAA7231_DEBUG, 1, "SAA7231 device:%d initialized", num);
+	num += 1;
+	err = device_create_file(&pdev->dev, &dev_attr_gpio_ctl);
+	if (!err)
+		err = device_create_file(&pdev->dev, &dev_attr_bsl_load);
+	if (!err)
+		err = device_create_file(&pdev->dev, &dev_attr_bar_dump);
+	if (!err)
+		err = device_create_file(&pdev->dev, &dev_attr_reg_write);
+	if (err)
+		dev_info(&pdev->dev, "SAA7231: failed to create bsl_load/bar_dump/reg_write sysfs (%d)\n", err);
+	else
+		dev_info(&pdev->dev, "SAA7231: bsl_load/bar_dump/reg_write sysfs ready\n");
+	return 0;
+
+//fail7:
+//	saa7231_alsa_exit(saa7231);
+//fail6:
+//	saa7231_dvb_exit(saa7231);
+fail5:
+	saa7231_i2c_exit(saa7231);
+fail4:
+	saa7231_msi_exit(saa7231);
+fail3:
+	saa7231_cgu_exit(saa7231);
+fail2:
+	saa7231_pci_exit(saa7231);
+fail1:
+	kfree(saa7231);
+
+fail0:
+	return err;
+}
+
+static void saa7231_pci_remove(struct pci_dev *pdev)
+{
+	struct saa7231_dev *saa7231 = pci_get_drvdata(pdev);
+	BUG_ON(!saa7231);
+
+//	saa7231_alsa_exit(saa7231);
+
+//	saa7231_vfl_exit(saa7231);
+	saa7231_dvb_exit(saa7231);
+	saa7231_i2c_exit(saa7231);
+	saa7231_msi_exit(saa7231);
+	saa7231_cgu_exit(saa7231);
+	device_remove_file(&pdev->dev, &dev_attr_gpio_ctl);
+	device_remove_file(&pdev->dev, &dev_attr_bsl_load);
+	device_remove_file(&pdev->dev, &dev_attr_bar_dump);
+	device_remove_file(&pdev->dev, &dev_attr_reg_write);
+	saa7231_pci_exit(saa7231);
+	kfree(saa7231);
+	num -= 1;
+}
+
+
+#if 0 /* ---- frontend configs (disabled for stage-1 build) ---- */
+static struct tda10048_config bgt3575_tda10048_config = {
+	.demod_address    = 0x10 >> 1,
+	.output_mode      = TDA10048_SERIAL_OUTPUT,
+	.fwbulkwritelen   = TDA10048_BULKWRITE_200,
+	.inversion        = TDA10048_INVERSION_ON,
+	.dtv6_if_freq_khz = TDA10048_IF_3300,
+	.dtv7_if_freq_khz = TDA10048_IF_3800,
+	.dtv8_if_freq_khz = TDA10048_IF_4300,
+	.clk_freq_khz     = TDA10048_CLK_16000,
+};
+
+static struct tda18271_std_map bgt3585_tda18271_dvbt = {
+	.dvbt_6 = { .if_freq = 3300, .agc_mode = 3, .std = 4, .if_lvl = 1, .rfagc_top = 0x37 },
+	.dvbt_7 = { .if_freq = 3800, .agc_mode = 3, .std = 5, .if_lvl = 1, .rfagc_top = 0x37 },
+	.dvbt_8 = { .if_freq = 4300, .agc_mode = 3, .std = 6, .if_lvl = 1, .rfagc_top = 0x37 },
+};
+
+static struct tda18271_config bgt3575_tda18271_config = {
+	.std_map	= &bgt3585_tda18271_dvbt,
+	.gate		= TDA18271_GATE_DIGITAL,
+};
+
+static struct stv090x_config bgt3575_stv090x_config = {
+	.device			= STV0903,
+	.demod_mode		= STV090x_SINGLE,
+	.clk_mode		= STV090x_CLK_EXT,
+
+	.xtal			= 8000000,
+	.address		= 0xd0 >> 1,
+
+	.ts3_clk                = 81000000,
+	.ts3_mode		= STV090x_TSMODE_SERIAL_CONTINUOUS,
+	.repeater_level		= STV090x_RPTLEVEL_16,
+};
+
+static struct stv6110x_config bgt3575_stv6110x_config = {
+	.addr			= 0xc6 >> 1,
+	.refclk			= 16000000,
+	.clk_div		= 2,
+};
+
+static u8 bgt3575_lnbh23_config = {
+	0x16 >> 1,
+};
+
+static struct stv090x_config bgt3576_stv090x_config = {
+	.device			= STV0903,
+	.demod_mode		= STV090x_SINGLE,
+	.clk_mode		= STV090x_CLK_EXT,
+
+	.xtal			= 8000000,
+	.address		= 0xd0 >> 1,
+
+	.ts3_clk                = 81000000,
+	.ts3_mode		= STV090x_TSMODE_SERIAL_CONTINUOUS,
+	.repeater_level		= STV090x_RPTLEVEL_16,
+};
+
+static struct stv6110x_config bgt3576_stv6110x_config = {
+	.addr			= 0xc6 >> 1,
+	.refclk			= 16000000,
+	.clk_div		= 2,
+};
+
+static u8 bgt3576_lnbh23_config = {
+	0x16 >> 1,
+};
+
+static struct s5h1411_config bgt3576_s5h1411_config = {
+	.output_mode	= S5H1411_SERIAL_OUTPUT,
+	.gpio		= S5H1411_GPIO_OFF,
+	.vsb_if		= S5H1411_IF_44000,
+	.qam_if		= S5H1411_IF_4000,
+	.inversion	= S5H1411_INVERSION_ON,
+	.status_mode	= S5H1411_DEMODLOCKING,
+	.mpeg_timing	= S5H1411_MPEGTIMING_CONTINOUS_NONINVERTING_CLOCK,
+};
+
+static struct tda18271_std_map bgt3576_tda18271_atsc = {
+	.atsc_6 = { .if_freq = 5380, .agc_mode = 3, .std = 3, .if_lvl = 6, .rfagc_top = 0x37 },
+	.qam_6  = { .if_freq = 4000, .agc_mode = 3, .std = 0, .if_lvl = 6, .rfagc_top = 0x37 },
+};
+
+static struct tda18271_config bgt3576_tda18271_config = {
+	.std_map	= &bgt3576_tda18271_atsc,
+	.gate		= TDA18271_GATE_DIGITAL,
+};
+
+static struct tda10048_config bgt3585_tda10048_config[] = {
+	{
+		.demod_address    = 0x10 >> 1,
+		.output_mode      = TDA10048_SERIAL_OUTPUT,
+		.fwbulkwritelen   = TDA10048_BULKWRITE_200,
+		.inversion        = TDA10048_INVERSION_ON,
+		.dtv6_if_freq_khz = TDA10048_IF_3300,
+		.dtv7_if_freq_khz = TDA10048_IF_3800,
+		.dtv8_if_freq_khz = TDA10048_IF_4300,
+		.clk_freq_khz     = TDA10048_CLK_16000,
+	}, {
+		.demod_address    = 0x12 >> 1,
+		.output_mode      = TDA10048_SERIAL_OUTPUT,
+		.fwbulkwritelen   = TDA10048_BULKWRITE_200,
+		.inversion        = TDA10048_INVERSION_ON,
+		.dtv6_if_freq_khz = TDA10048_IF_3300,
+		.dtv7_if_freq_khz = TDA10048_IF_3800,
+		.dtv8_if_freq_khz = TDA10048_IF_4300,
+		.clk_freq_khz     = TDA10048_CLK_16000,
+	}
+};
+
+static struct tda18271_config bgt3585_tda18271_config = {
+	.std_map	= &bgt3585_tda18271_dvbt,
+	.gate		= TDA18271_GATE_DIGITAL,
+};
+
+static struct stv090x_config bgt3595_stv090x_config = {
+	.device			= STV0900,
+	.demod_mode		= STV090x_DUAL,
+	.clk_mode		= STV090x_CLK_EXT,
+
+	.xtal			= 8000000,
+	.address		= 0xd0 >> 1,
+
+	.repeater_level		= STV090x_RPTLEVEL_16,
+
+	.adc1_range		= STV090x_ADC_1Vpp,
+	.adc2_range		= STV090x_ADC_1Vpp,
+
+	.ts1_mode		= STV090x_TSMODE_SERIAL_PUNCTURED,
+	.ts2_mode		= STV090x_TSMODE_SERIAL_PUNCTURED,
+};
+
+static struct stv6110x_config bgt3595_stv6110x_config = {
+	.addr			= 0xC6 >> 1,
+	.refclk			= 16000000,
+	.clk_div		= 2,
+};
+
+static u8 bgt3595_lnbh24_config[] = {
+	0x12 >> 1,
+	0x14 >> 1,
+};
+
+static struct tda18271_config purus_mpcie_tda18271_config = {
+	.gate		= TDA18271_GATE_DIGITAL,
+};
+
+static struct s5h1411_config purus_mpcie_s5h1411_config = {
+	.output_mode	= S5H1411_SERIAL_OUTPUT,
+	.gpio		= S5H1411_GPIO_OFF,
+	.vsb_if		= S5H1411_IF_5380,
+	.qam_if		= S5H1411_IF_4000,
+	.inversion	= S5H1411_INVERSION_ON,
+	.status_mode	= S5H1411_DEMODLOCKING,
+	.mpeg_timing	= S5H1411_MPEGTIMING_CONTINOUS_NONINVERTING_CLOCK,
+};
+
+static struct tda18272_config bgt3620_tda18272_config[] = {
+	{
+		.addr		= (0xc0 >> 1),
+		.mode		= TDA18272_MASTER,
+	}, {
+		.addr		= (0xc0 >> 1),
+		.mode		= TDA18272_SLAVE,
+	}
+};
+
+
+static struct cxd2820r_config bgt3620_cxd2820r_config = {
+	.i2c_address	= (0xd8 >> 1),
+	.ts_mode	= CXD2820R_TS_SERIAL,
+};
+
+static struct cxd2850_config bgt3636_cxd2850_config = {
+	.xtal		= 27000000,
+	.dmd_addr	= (0xd0 >> 1),
+	.tnr_addr	= (0xc0 >> 1),
+	.shared_xtal	= 1,
+	.serial_ts	= 1,
+	.serial_d0	= 0,
+	.tsclk_pol	= 1,
+	.tone_out	= 1,
+};
+
+static struct a8290_config bgt3636_a8290_config = {
+	.address	= (0x10 >> 1),
+};
+
+static struct cxd2817_config bgt3636_cxd2817_config = {
+	.xtal		= 41000000,
+	.addr		= (0xd8 >> 1),
+	.serial_ts	= 1,
+};
+
+static struct cxd2861_cfg bgt3636_cxd2861_config = {
+	.address	= (0xc0 >> 1),
+
+	.ext_osc	= 1,
+	.f_xtal		= 41,
+};
+#endif /* ---- /frontend configs ---- */
+
+#define NXP				"NXP Semiconductor"
+#define PURUS_PCIe_REF			0x0001
+#define PURUS_PCI_REF			0x0002
+#define PURUS_mPCIe_REF			0x0003
+
+
+#define BLACKGOLD			"Blackgold Technology"
+#define BLACKGOLD_TECHNOLOGY		0x14c7
+#define BLACKGOLD_BGT3575		0x3575
+#define BLACKGOLD_BGT3576		0x3576
+#define BLACKGOLD_BGT3585		0x3585
+#define BLACKGOLD_BGT3596		0x3596
+#define BLACKGOLD_BGT3595		0x3595
+#define BLACKGOLD_BGT3600		0x3600
+#define BLACKGOLD_BGT3602		0x3602
+#define BLACKGOLD_BGT3620		0x3620
+#define BLACKGOLD_BGT3630		0x3630
+#define BLACKGOLD_BGT3650		0x3650
+#define BLACKGOLD_BGT3651		0x3651
+#define BLACKGOLD_BGT3660		0x3660
+#define BLACKGOLD_BGT3685		0x3685
+#define BLACKGOLD_BGT3695		0x3695
+#define BLACKGOLD_BGT3696		0x3696
+#define BLACKGOLD_BGT3636		0x3636
+
+#define AVERMEDIA			"AVerMedia"
+#define AVERMEDIA_TECHNOLOGY		0x1461
+#define AVERMEDIA_A328_DTMB		0x8323
+
+#define YUAN				"Yuan"
+#define YUAN_TECHNOLOGY			0x12ab
+#define YUAN_MC163ML			0x3162
+
+/* NOTE: these MUST be PCI_ANY_ID (0xffff), NOT 0x0000!
+ * subvendor/subdevice == 0x0000 means "match a device whose subsystem
+ * ID is literally 0x0000" - the wildcard entries never match anything,
+ * so probe is never invoked for non-BlackGold cards (e.g. Avermedia 1461:8323,
+ * Yuan 12ab:3162). 0xffff = PCI_ANY_ID = real wildcard. */
+#define SUBVENDOR_ALL			PCI_ANY_ID
+#define SUBDEVICE_ALL			PCI_ANY_ID
+
+#define MAKE_DESC(__vendor, __product, __type) {	\
+	.vendor		= (__vendor),			\
+	.product	= (__product),			\
+	.type		= (__type),			\
+}
+
+enum {
+	PURUS_PCIE = 0,
+	PURUS_MPCIE,
+	PURUS_PCI,
+
+	BGT3595,
+	BGT3596,
+	BGT3585,
+	BGT3576,
+	BGT3575,
+	BGT3600,
+	BGT3602,
+	BGT3620,
+	BGT3630,
+	BGT3650,
+	BGT3651,
+	BGT3660,
+	BGT3685,
+	BGT3695,
+	BGT3696,
+	BGT3636,
+	AVER_A328,
+	YUAN_MC163ML_BOARD
+};
+
+static struct card_desc saa7231_desc[] = {
+	MAKE_DESC(NXP,		"Purus PCIe",	"DVB-S + DVB-T + Analog Ref. design"),
+	MAKE_DESC(NXP,		"Purus mPCIe",	"DVB-T + ATSC + Analog Ref. design"),
+	MAKE_DESC(NXP,		"Purus PCI",	"DVB-S + DVB-T + Analog Ref. design"),
+
+	MAKE_DESC(BLACKGOLD,	"BGT3595", 	"Dual DVB-S/S2 + Analog"),
+	MAKE_DESC(BLACKGOLD,	"BGT3596", 	"Dual ATSC"),
+	MAKE_DESC(BLACKGOLD,	"BGT3585", 	"Dual DVB-T/H + Analog"),
+	MAKE_DESC(BLACKGOLD,	"BGT3576", 	"DVB-S/S2 + ATSC"),
+	MAKE_DESC(BLACKGOLD,	"BGT3575", 	"DVB-S/S2 + DVB-T/H"),
+	MAKE_DESC(BLACKGOLD,	"BGT3600",	"DVB-T/T2 + Analog"),
+	MAKE_DESC(BLACKGOLD,	"BGT3602",	"Dual DVB-T/T2/C + Analog"),
+	MAKE_DESC(BLACKGOLD,	"BGT3620",	"Dual DVB-T/T2/C + Analog"),
+	MAKE_DESC(BLACKGOLD,	"BGT3630",	"DVB-T/T2 + DVB-S/S2 + Analog"),
+	MAKE_DESC(BLACKGOLD,	"BGT3650",	"Dual DVB-T/T2 + Analog"),
+	MAKE_DESC(BLACKGOLD,	"BGT3651",	"Dual DVB-T/T2 + Analog"),
+	MAKE_DESC(BLACKGOLD,	"BGT3660",	"Dual DVB-T/T2 + Analog"),
+	MAKE_DESC(BLACKGOLD,	"BGT3685",	"Dual DVB-T + Analog"),
+	MAKE_DESC(BLACKGOLD,	"BGT3695",	"Dual DVB-T + Analog"),
+	MAKE_DESC(BLACKGOLD,	"BGT3696",	"Dual ATSC + Analog"),
+	MAKE_DESC(BLACKGOLD,	"BGT3636",	"DVB-S/S2 + DVB-T/T2/C + Analog"),
+	MAKE_DESC(AVERMEDIA,	"A328",		"Pure DTMB (LGS8G75 + TDA18271)"),
+	MAKE_DESC(YUAN,		"MC163ML",	"DTMB (LGS8G75, no tuner)"),
+	{ }
+};
+
+#define SUBSYS_INFO(__vendor, __device) ((__vendor << 16) | __device)
+#define DEVICE_DESC(__devid)	(&saa7231_desc[(__devid)])
+
+static int saa7231_frontend_enable(struct saa7231_dev *saa7231)
+{
+	struct pci_dev *pdev		= saa7231->pdev;
+	u32 subsystem_info		= SUBSYS_INFO(pdev->subsystem_vendor, pdev->subsystem_device);
+	int ret = 0;
+
+	switch (subsystem_info) {
+	case SUBSYS_INFO(NXP_REFERENCE_BOARD, PURUS_PCIe_REF):
+		break;
+	case SUBSYS_INFO(NXP_REFERENCE_BOARD, PURUS_mPCIe_REF):
+		GPIO_SET_OUT(GPIO_3 | GPIO_4 | GPIO_5);
+		if (saa7231_gpio_set(saa7231, GPIO_3, 0) < 0)
+			ret = -EIO;
+		msleep(100);
+		if (saa7231_gpio_reset(saa7231, GPIO_5, 10) < 0)
+			ret = -EIO;
+		if (saa7231_gpio_reset(saa7231, GPIO_4, 10) < 0)
+			ret = -EIO;
+		break;
+	case SUBSYS_INFO(BLACKGOLD_TECHNOLOGY, BLACKGOLD_BGT3595):
+		GPIO_SET_OUT(GPIO_1);
+		if (saa7231_gpio_reset(saa7231, GPIO_0, 50) < 0)
+			ret = -EIO;
+		break;
+	case SUBSYS_INFO(BLACKGOLD_TECHNOLOGY, BLACKGOLD_BGT3585):
+		GPIO_SET_OUT(GPIO_1);
+		if (saa7231_gpio_reset(saa7231, GPIO_0, 50) < 0)
+			ret = -EIO;
+		break;
+	case SUBSYS_INFO(BLACKGOLD_TECHNOLOGY, BLACKGOLD_BGT3576):
+		GPIO_SET_OUT(GPIO_1 | GPIO_2);
+		if (saa7231_gpio_reset(saa7231, GPIO_2, 50) < 0)
+			ret = -EIO;
+		if (saa7231_gpio_reset(saa7231, GPIO_1, 50) < 0)
+			ret = -EIO;
+		break;
+	case SUBSYS_INFO(BLACKGOLD_TECHNOLOGY, BLACKGOLD_BGT3575):
+		GPIO_SET_OUT(GPIO_1 | GPIO_2);
+		if (saa7231_gpio_reset(saa7231, GPIO_1, 50) < 0)
+			ret = -EIO;
+		break;
+	case SUBSYS_INFO(BLACKGOLD_TECHNOLOGY, BLACKGOLD_BGT3600):
+		GPIO_SET_OUT(GPIO_1);
+		if (saa7231_gpio_reset(saa7231, GPIO_1, 50) < 0)
+			ret = -EIO;
+		break;
+	case SUBSYS_INFO(BLACKGOLD_TECHNOLOGY, BLACKGOLD_BGT3602):
+		GPIO_SET_OUT(GPIO_2);
+		if (saa7231_gpio_reset(saa7231, GPIO_2, 50) < 0)
+			ret = -EIO;
+		break;
+	case SUBSYS_INFO(BLACKGOLD_TECHNOLOGY, BLACKGOLD_BGT3620):
+		GPIO_SET_OUT(GPIO_2);
+		if (saa7231_gpio_reset(saa7231, GPIO_2, 50) < 0)
+			ret = -EIO;
+		break;
+	case SUBSYS_INFO(BLACKGOLD_TECHNOLOGY, BLACKGOLD_BGT3630):
+		GPIO_SET_OUT(GPIO_1 | GPIO_2);
+		if (saa7231_gpio_reset(saa7231, GPIO_1, 50) < 0)
+			ret = -EIO;
+		if (saa7231_gpio_reset(saa7231, GPIO_2, 50) < 0)
+			ret = -EIO;
+		break;
+	case SUBSYS_INFO(BLACKGOLD_TECHNOLOGY, BLACKGOLD_BGT3650):
+		GPIO_SET_OUT(GPIO_1);
+		if (saa7231_gpio_reset(saa7231, GPIO_1, 50) < 0)
+			ret = -EIO;
+		break;
+	case SUBSYS_INFO(BLACKGOLD_TECHNOLOGY, BLACKGOLD_BGT3651):
+		GPIO_SET_OUT(GPIO_1);
+		if (saa7231_gpio_reset(saa7231, GPIO_1, 50) < 0)
+			ret = -EIO;
+		break;
+	case SUBSYS_INFO(BLACKGOLD_TECHNOLOGY, BLACKGOLD_BGT3660):
+		GPIO_SET_OUT(GPIO_1);
+		if (saa7231_gpio_reset(saa7231, GPIO_1, 50) < 0)
+			ret = -EIO;
+		break;
+	case SUBSYS_INFO(BLACKGOLD_TECHNOLOGY, BLACKGOLD_BGT3685):
+		GPIO_SET_OUT(GPIO_1);
+		if (saa7231_gpio_reset(saa7231, GPIO_1, 50) < 0)
+			ret = -EIO;
+		break;
+	case SUBSYS_INFO(BLACKGOLD_TECHNOLOGY, BLACKGOLD_BGT3695):
+		GPIO_SET_OUT(GPIO_1);
+		if (saa7231_gpio_reset(saa7231, GPIO_1, 50) < 0)
+			ret = -EIO;
+		break;
+	case SUBSYS_INFO(BLACKGOLD_TECHNOLOGY, BLACKGOLD_BGT3696):
+		GPIO_SET_OUT(GPIO_1);
+		if (saa7231_gpio_reset(saa7231, GPIO_1, 50) < 0)
+			ret = -EIO;
+		break;
+	case SUBSYS_INFO(BLACKGOLD_TECHNOLOGY, BLACKGOLD_BGT3636):
+		GPIO_SET_OUT(GPIO_1 | GPIO_2);
+		if (saa7231_gpio_reset(saa7231, GPIO_1, 50) < 0)
+			ret = -EIO;
+		if (saa7231_gpio_reset(saa7231, GPIO_2, 50) < 0)
+			ret = -EIO;
+		break;
+	case SUBSYS_INFO(AVERMEDIA_TECHNOLOGY, AVERMEDIA_A328_DTMB):
+		/* GPIO0-7 power/control the front-end chips. Verified on the
+		 * bench: pulling them low kills the TDA18271 on i2c-2 (0x60 no
+		 * longer ACKs), restoring them high revives it. Force all high
+		 * at probe so demod 0x21 + tuner 0x60 stay powered. */
+		GPIO_SET_OUT(0xFF);
+		if (saa7231_gpio_set(saa7231, 0xFF, 1) < 0)
+			ret = -EIO;
+		/* DEBUG: GPIO5 pull-low DISABLED - combined with the MSCD clock
+		 * enable it makes the SAA7231 vanish from the PCI bus. */
+		/* saa7231_gpio_set(saa7231, GPIO_5, 0); */
+		break;
+	case SUBSYS_INFO(YUAN_TECHNOLOGY, YUAN_MC163ML):
+		/* GPIO0-7 power the front-end. Verified: the tuner on i2c-1:0x60
+		 * only appears on the bus after pulling them high. */
+		GPIO_SET_OUT(0xFF);
+		if (saa7231_gpio_set(saa7231, 0xFF, 1) < 0)
+			ret = -EIO;
+		msleep(50);
+		break;
+	}
+	return ret;
+}
+
+
+static int saa7231_frontend_attach(struct saa7231_dvb *dvb, int frontend);
+
+static int saa7231_frontend_attach(struct saa7231_dvb *dvb, int frontend);
+
+/* ------------------------------------------------------------------
+ * AVerMedia A328 Pure DTMB frontend configuration
+ * ------------------------------------------------------------------ */
+
+/* LGS8G75 ADC clock (kHz). Default 30400 is the Legend Silicon
+ * reference value; the A328 board crystal may differ, so this is
+ * exposed as a module parameter for on-the-fly sweeping:
+ *   echo 28800 > /sys/module/saa7231_drv/parameters/a328_if_clk
+ * then reload saa7231_drv. */
+static int a328_if_clk = 13040;
+module_param(a328_if_clk, int, 0644);
+MODULE_PARM_DESC(a328_if_clk, "LGS8G75 ADC clock in kHz (A328, default 30400)");
+
+static int a328_if_neg_center = 0;
+module_param(a328_if_neg_center, int, 0644);
+MODULE_PARM_DESC(a328_if_neg_center, "LGS8G75 IF negative center (default 0)");
+
+static int a328_if_neg_edge = 1;
+module_param(a328_if_neg_edge, int, 0644);
+MODULE_PARM_DESC(a328_if_neg_edge, "LGS8G75 IF negative edge (default 1)");
+
+static int a328_adc_signed = 1;
+module_param(a328_adc_signed, int, 0644);
+MODULE_PARM_DESC(a328_adc_signed, "LGS8G75 ADC signed (default 1)");
+
+static int a328_adc_vpp = 3;
+module_param(a328_adc_vpp, int, 0644);
+MODULE_PARM_DESC(a328_adc_vpp, "LGS8G75 ADC Vpp select 0-3 (default 3)");
+
+/* GPIO bit used for LGS8G75 hardware reset pulse (0..7 = GPIO0..7, -1 = skip).
+ *   echo 3 > /sys/module/saa7231_drv/parameters/a328_gpio_reset
+ *   rmmod saa7231_drv && insmod saa7231_drv.ko a328_gpio_reset=3
+ * The pulse fires once in saa7231_frontend_attach() before dvb_attach().
+ * default 0 = GPIO_0 (backward-compatible with the original probe patch). */
+static int a328_gpio_reset = 0;
+module_param(a328_gpio_reset, int, 0644);
+MODULE_PARM_DESC(a328_gpio_reset, "GPIO bit for LGS8G75 hardware reset pulse (0..7, -1=skip, default 0)");
+
+static struct lgs8gxx_config a328_lgs8g75_config = {
+	.prod			= LGS8GXX_PROD_LGS8G75,
+	.demod_address		= 0x21,		/* i2c-0 */
+
+	.serial_ts		= 0,		/* parallel TS */
+	.ts_clk_pol		= 1,
+	.ts_clk_gated		= 0,
+
+	.if_clk_freq		= 30400,		/* kHz, ADC clock */
+	.if_freq		= 4570,		/* kHz, from INF */
+
+	.ext_adc		= 0,
+	.adc_signed		= 1,
+	.adc_vpp		= 3,
+	.if_neg_edge		= 0,
+	.if_neg_center		= 0,
+
+	.tuner_address		= 0,		/* tuner on i2c-2, no gate */
+};
+
+/* Sparse std map: only dvbt_8 is overridden, the rest keep the
+ * tda18271c2 defaults (tda18271_update_std() skips zeroed entries).
+ * Values decoded from AVer7231_A328_Pure_DTMB.inf:
+ *   DVBT_8M_STD = 0x19 -> agc_mode = 3, std = 1
+ *   DVBT_IF_FREQ_8M = 4570000 Hz -> if_freq = 4570 kHz
+ *   IFLevel_DVBT = 7 -> if_lvl = 7 */
+static struct tda18271_std_map a328_tda18271_std_map = {
+	.dvbt_8			= { .if_freq = 4570, .fm_rfn = 0, .agc_mode = 3,
+				    .std = 1, .if_lvl = 7, .rfagc_top = 0x37 },
+};
+
+static struct tda18271_config a328_tda18271_config = {
+	.std_map		= &a328_tda18271_std_map,
+	.gate			= TDA18271_GATE_DIGITAL,
+	/* CRITICAL: OUTPUT_LT_OFF makes tda18271 set_params() SKIP the
+	 * output-stage enable (it only toggles it for loop-through modes),
+	 * leaving the tuner in standby so the IF never reaches the LGS8G75.
+	 * Use LT_XT_ON so attach+set_params switch the output to receive. */
+	.output_opt		= TDA18271_OUTPUT_LT_XT_ON,
+};
+
+static int (*a328_tuner_set_params_orig)(struct dvb_frontend *fe);
+static int (*a328_set_frontend_orig)(struct dvb_frontend *fe);
+
+/* Dual-card fix: resolve the owning SAA7231 device / tuner I2C adapter
+ * from the frontend instead of static globals.  The old globals were
+ * overwritten by the 2nd card's attach, so tuning card0 would poke
+ * card1's CGU/I2C and wedge its I2C controller (TXFIFO timeout storm). */
+static struct saa7231_dvb *a328_fe_to_dvb(struct dvb_frontend *fe)
+{
+	if (!fe || !fe->dvb)
+		return NULL;
+	return container_of(fe->dvb, struct saa7231_dvb, dvb_adapter);
+}
+
+static struct saa7231_dev *a328_fe_to_dev(struct dvb_frontend *fe)
+{
+	struct saa7231_dvb *dvb = a328_fe_to_dvb(fe);
+	return dvb ? dvb->saa7231 : NULL;
+}
+
+static struct i2c_adapter *a328_fe_to_tuner_i2c(struct dvb_frontend *fe)
+{
+	struct saa7231_dev *saa7231 = a328_fe_to_dev(fe);
+	return saa7231 ? &saa7231->i2c[2].i2c_adapter : NULL;
+}
+
+/* Enable the MSCD/TS clock outputs (CGU 0x58..0x7C) that the upstream
+ * cgu_init leaves gated.  Windows driver writes (src<<24)|0x081D here
+ * (verified by reverse-engineering AVer7231_x64.sys: 0xB0FE1 loop,
+ * 0xB2451/0xB0F76); without them the LGS8G75 has no clock and every
+ * register read returns 0xFF (fake 100% lock).
+ *
+ * SAFETY: ONLY the 10 clock outputs 0x58..0x7C (XTAL_DCSN .. 128FS_ADC)
+ * may be written at runtime.  Offsets 0x80..0x90 (EPICS/PCC/CTRL_PCC/
+ * STREAM_PCC/TS_OUT_CA_EXT_PCC) are PCIe-link landmines: writing them
+ * makes the SAA7231 vanish from the bus (03:00.0 gone, only reboot
+ * recovers - 64-bit pref BAR window allocation fails on this Atom box).
+ * Also only call at RUNTIME (tune time), never at probe/attach. */
+static void a328_mscd_clk_on(struct saa7231_dev *saa7231)
+{
+	if (!saa7231)
+		return;
+	dev_info(&saa7231->pdev->dev,
+		 "A328: mscd_clk_on: enabling 10 clock outputs 0x58..0x7C\n");
+	SAA7231_WR(0x0000081C, SAA7231_BAR0, CGU, CGU_CLK_XTAL_DCSN_OUT);
+	SAA7231_WR(0x0A00081D, SAA7231_BAR0, CGU, CGU_CLK_VADCA_MSCD_OUT);
+	SAA7231_WR(0x0000081D, SAA7231_BAR0, CGU, CGU_CLK_VADCB_MSCD_OUT);
+	SAA7231_WR(0x0F00081D, SAA7231_BAR0, CGU, CGU_CLK_TS_MSCD_OUT);
+	SAA7231_WR(0x0F00081D, SAA7231_BAR0, CGU, CGU_CLK_MSCD_OUT);
+	SAA7231_WR(0x0000081D, SAA7231_BAR0, CGU, CGU_CLK_MSCD_AXI_OUT);
+	SAA7231_WR(0x0000081D, SAA7231_BAR0, CGU, CGU_CLK_VCP_OUT);
+	SAA7231_WR(0x0B00081D, SAA7231_BAR0, CGU, CGU_CLK_REF_PLL_AUD_OUT);
+	SAA7231_WR(0x1200081D, SAA7231_BAR0, CGU, CGU_CLK_128FS_AUD_OUT);
+	SAA7231_WR(0x0000081D, SAA7231_BAR0, CGU, CGU_CLK_128FS_ADC_OUT);
+	/* 0x80..0x90 (EPICS_AUD/PCC/CTRL_PCC/STREAM_PCC/TS_OUT_CA_EXT_PCC)
+	 * deliberately NOT written - PCIe link landmine, device vanishes. */
+}
+
+static int a328_set_frontend(struct dvb_frontend *fe)
+{
+	a328_mscd_clk_on(a328_fe_to_dev(fe));
+	if (a328_set_frontend_orig)
+		return a328_set_frontend_orig(fe);
+	return 0;
+}
+
+static int a328_tuner_set_params(struct dvb_frontend *fe)
+{
+	struct dtv_frontend_properties *c = &fe->dtv_property_cache;
+	int ret;
+
+	if (c->delivery_system == SYS_DTMB) {
+		c->delivery_system = SYS_DVBT;
+		c->bandwidth_hz = 8000000;
+	}
+	ret = a328_tuner_set_params_orig(fe);
+
+	/*
+	 * tda18271 may leave the output stage in standby on some
+	 * set_params paths.  Force the receive state by writing the
+	 * R_TM (0x01) thermo byte directly through the SAA7231 I2C
+	 * bus: clear standby bit 0x20, keep loop-through(0x08) and
+	 * xtal(0x04) as set by tda18271.
+	 */
+	if (!ret) {
+		struct i2c_adapter *tuner_i2c = a328_fe_to_tuner_i2c(fe);
+		u8 reg = 0x01;
+		u8 val = 0xff;
+		struct i2c_msg rd[2] = {
+			{ .addr = 0x60, .flags = 0, .len = 1, .buf = &reg },
+			{ .addr = 0x60, .flags = I2C_M_RD, .len = 1, .buf = &val },
+		};
+
+		if (tuner_i2c && i2c_transfer(tuner_i2c, rd, 2) == 2) {
+			u8 wr[2] = { 0x01, (u8)(val & ~0x20) };
+			struct i2c_msg wm = { .addr = 0x60, .flags = 0,
+					      .len = 2, .buf = wr };
+			i2c_transfer(tuner_i2c, &wm, 1);
+		}
+	}
+
+	return ret;
+}
+
+/* ------------------------------------------------------------------
+ * YUAN MC163ML front-end: RTL2836B demod + tuner
+ * ------------------------------------------------------------------ */
+static struct rtl2836_config yuan_rtl2836_cfg = {
+	.i2c_addr	= 0x21,		/* bus 12: RTL2836B */
+	.ts_serial	= 0,		/* parallel TS; module param to flip */
+	.spec_inv	= 0,
+};
+
+static struct saa7231_config avermedia_a328_dtmb = {
+	.desc			= DEVICE_DESC(AVER_A328),
+
+	.xtal			= 54,
+	.i2c_rate		= SAA7231_I2C_RATE_100,	/* LGS8G75 fw download needs slow bus */
+	.root_clk		= CLK_ROOT_54MHz,
+	.irq_handler		= saa7231_irq_handler,
+
+	.ext_dvb_adapters	= 1,
+	.ts0_cfg		= 0x41,
+	.ts0_clk		= 0x05,
+
+	.frontend_enable	= saa7231_frontend_enable,
+	.frontend_attach	= saa7231_frontend_attach,
+
+	.stream_ports		= 1,
+};
+
+static struct saa7231_config yuan_mc163ml = {
+	.desc			= DEVICE_DESC(YUAN_MC163ML_BOARD),
+
+	.xtal			= 54,
+	.i2c_rate		= SAA7231_I2C_RATE_400,
+	.root_clk		= CLK_ROOT_54MHz,
+	.irq_handler		= saa7231_irq_handler,
+
+	.ext_dvb_adapters	= 1,
+	.ts0_cfg		= 0x41,
+	.ts0_clk		= 0x05,
+
+	.frontend_enable	= saa7231_frontend_enable,
+	.frontend_attach	= saa7231_frontend_attach,
+
+	.stream_ports		= 1,
+};
+
+#if 0 /* stage-1: original multi-board frontend attach disabled */
+static int saa7231_frontend_attach(struct saa7231_dvb *dvb, int frontend)
+{
+	struct saa7231_dev *saa7231	= dvb->saa7231;
+	struct pci_dev *pdev		= saa7231->pdev;
+	u32 subsystem_info		= SUBSYS_INFO(pdev->subsystem_vendor, pdev->subsystem_device);
+
+	struct saa7231_i2c *i2c_0	= &saa7231->i2c[0];
+	struct saa7231_i2c *i2c_1	= &saa7231->i2c[1];
+	struct saa7231_i2c *i2c_2	= &saa7231->i2c[2];
+
+	struct saa7231_i2c *i2c;
+	struct stv6110x_devctl *ctl;
+	int ret = 0;
+
+	dprintk(SAA7231_DEBUG, 1, "Frontend Init Adapter (%d) Device ID=%02x",
+		frontend,
+		saa7231->pdev->subsystem_device);
+
+	switch (subsystem_info) {
+	case SUBSYS_INFO(BLACKGOLD_TECHNOLOGY, BLACKGOLD_BGT3636):
+		dprintk(SAA7231_ERROR, 1, "BGT3636 Found .. !");
+		if (frontend == 1) {
+			dvb->fe = dvb_attach(cxd2850_attach,
+					     &bgt3636_cxd2850_config,
+					     &saa7231->i2c[frontend].i2c_adapter);
+
+			if (!dvb->fe) {
+				dprintk(SAA7231_ERROR, 1, "Frontend:%d attach failed", frontend);
+				ret = -ENODEV;
+				goto exit;
+			}
+			dvb_attach(a8290_attach,
+				   dvb->fe,
+				   &bgt3636_a8290_config,
+				   &saa7231->i2c[frontend - 1].i2c_adapter);
+		}
+		if (frontend == 0) {
+			dvb->fe = dvb_attach(cxd2817_attach,
+					     &bgt3636_cxd2817_config,
+					     &saa7231->i2c[2 + frontend].i2c_adapter);
+
+			if (!dvb->fe) {
+				dprintk(SAA7231_ERROR, 1, "Frontend:%d attach failed", frontend);
+				ret = -ENODEV;
+				goto exit;
+			}
+			dvb_attach(cxd2861_attach,
+				   dvb->fe,
+				   &bgt3636_cxd2861_config,
+				   &saa7231->i2c[2 + frontend].i2c_adapter);
+		}
+		break;
+	case SUBSYS_INFO(BLACKGOLD_TECHNOLOGY, BLACKGOLD_BGT3651):
+		dvb->fe = dvb_attach(cxd2820r_attach,
+				     &bgt3620_cxd2820r_config,
+				     &saa7231->i2c[1 + frontend].i2c_adapter,
+				     NULL);
+
+		if (!dvb->fe) {
+			dprintk(SAA7231_ERROR, 1, "Frontend:%d attach failed", frontend);
+			ret = -ENODEV;
+			goto exit;
+		} else {
+			dvb_attach(tda18272_attach,
+				   dvb->fe,
+				   &saa7231->i2c[1 + frontend].i2c_adapter,
+				   &bgt3620_tda18272_config[frontend]);
+		}
+		ret = 0;
+		break;
+	case SUBSYS_INFO(BLACKGOLD_TECHNOLOGY, BLACKGOLD_BGT3650):
+		dvb->fe = dvb_attach(cxd2820r_attach,
+				     &bgt3620_cxd2820r_config,
+				     &saa7231->i2c[1 + frontend].i2c_adapter,
+				     NULL);
+
+		if (!dvb->fe) {
+			dprintk(SAA7231_ERROR, 1, "Frontend:%d attach failed", frontend);
+			ret = -ENODEV;
+			goto exit;
+		} else {
+			dvb_attach(tda18272_attach,
+				   dvb->fe,
+				   &saa7231->i2c[1 + frontend].i2c_adapter,
+				   &bgt3620_tda18272_config[frontend]);
+		}
+		ret = 0;
+		break;
+	case SUBSYS_INFO(BLACKGOLD_TECHNOLOGY, BLACKGOLD_BGT3630):
+		if (frontend == 1) {
+			dvb->fe = dvb_attach(stv090x_attach,
+					     &bgt3575_stv090x_config,
+					     &i2c_1->i2c_adapter,
+					     STV090x_DEMODULATOR_0);
+			if (!dvb->fe) {
+				dprintk(SAA7231_ERROR, 1, "Frontend:%d attach failed", frontend);
+				ret = -ENODEV;
+				goto exit;
+
+			}
+			ctl = dvb_attach(stv6110x_attach,
+					 dvb->fe,
+					 &bgt3575_stv6110x_config,
+					 &i2c_1->i2c_adapter);
+
+			if (!ctl) {
+				dprintk(SAA7231_ERROR, 1, "Frontend:%d attach failed", frontend);
+				ret = -ENODEV;
+				goto exit;
+			}
+			STV090x_CFGUPDATE(&bgt3575_stv090x_config, ctl);
+			if (dvb->fe->ops.init)
+				dvb->fe->ops.init(dvb->fe);
+
+			if (dvb_attach(lnbh24_attach,
+				       dvb->fe,
+				       &i2c_0->i2c_adapter,
+				       0,
+				       0,
+				       bgt3575_lnbh23_config) == NULL) {
+
+				dprintk(SAA7231_ERROR, 1, "LNBH23 not found");
+				goto exit;
+			}
+		}
+		if (frontend == 0) {
+			dvb->fe = dvb_attach(cxd2820r_attach,
+					     &bgt3620_cxd2820r_config,
+					     &saa7231->i2c[2 + frontend].i2c_adapter,
+					     NULL);
+			if (!dvb->fe) {
+				dprintk(SAA7231_ERROR, 1, "Frontend:%d attach failed", frontend);
+				ret = -ENODEV;
+				goto exit;
+			} else {
+				dvb_attach(tda18272_attach,
+					   dvb->fe,
+					   &saa7231->i2c[2 + frontend].i2c_adapter,
+					   bgt3620_tda18272_config);
+			}
+		}
+		ret = 0;
+		break;
+	case SUBSYS_INFO(BLACKGOLD_TECHNOLOGY, BLACKGOLD_BGT3602):
+#if 1
+		dvb->fe = dvb_attach(cxd2820r_attach,
+				     &bgt3620_cxd2820r_config,
+				     &saa7231->i2c[1 + frontend].i2c_adapter,
+				     NULL);
+
+		if (!dvb->fe) {
+			dprintk(SAA7231_ERROR, 1, "Frontend:%d attach failed", frontend);
+			ret = -ENODEV;
+			goto exit;
+		} else {
+			dvb_attach(tda18272_attach,
+				   dvb->fe,
+				   &saa7231->i2c[1 + frontend].i2c_adapter,
+				   &bgt3620_tda18272_config[frontend]);
+		}
+#endif
+#if 0
+		dvb->fe = dvb_attach(cxd2834_attach,
+				     NULL,
+				     &saa7231->i2c[1 + frontend].i2c_adapter,
+				     &bgt3620_cxd2834_config);
+
+		if (!dvb->fe) {
+			dprintk(SAA7231_ERROR, 1, "Frontend:%d attach failed", frontend);
+			ret = -ENODEV;
+			goto exit;
+		} else {
+			dvb_attach(tda18272_attach,
+				   dvb->fe,
+				   &saa7231->i2c[1 + frontend].i2c_adapter,
+				   &bgt3620_tda18272_config[frontend]);
+		}
+#endif
+		ret = 0;
+		break;
+	case SUBSYS_INFO(BLACKGOLD_TECHNOLOGY, BLACKGOLD_BGT3620):
+#if 1
+		dvb->fe = dvb_attach(cxd2820r_attach,
+				     &bgt3620_cxd2820r_config,
+				     &saa7231->i2c[1 + frontend].i2c_adapter,
+				     NULL);
+
+		if (!dvb->fe) {
+			dprintk(SAA7231_ERROR, 1, "Frontend:%d attach failed", frontend);
+			ret = -ENODEV;
+			goto exit;
+		} else {
+			dvb_attach(tda18272_attach,
+				   dvb->fe,
+				   &saa7231->i2c[1 + frontend].i2c_adapter,
+				   &bgt3620_tda18272_config[frontend]);
+		}
+#endif
+#if 0
+		dvb->fe = dvb_attach(cxd2834_attach,
+				     NULL,
+				     &saa7231->i2c[1 + frontend].i2c_adapter,
+				     &bgt3620_cxd2834_config);
+
+		if (!dvb->fe) {
+			dprintk(SAA7231_ERROR, 1, "Frontend:%d attach failed", frontend);
+			ret = -ENODEV;
+			goto exit;
+		} else {
+			dvb_attach(tda18272_attach,
+				   dvb->fe,
+				   &saa7231->i2c[1 + frontend].i2c_adapter,
+				   &bgt3620_tda18272_config[frontend]);
+		}
+#endif
+		ret = 0;
+		break;
+	case SUBSYS_INFO(BLACKGOLD_TECHNOLOGY, BLACKGOLD_BGT3600):
+		dvb->fe = dvb_attach(cxd2820r_attach,
+				     &bgt3620_cxd2820r_config,
+				     &saa7231->i2c[1 + frontend].i2c_adapter,
+				     NULL);
+
+		if (!dvb->fe) {
+			dprintk(SAA7231_ERROR, 1, "Frontend:%d attach failed", frontend);
+			ret = -ENODEV;
+			goto exit;
+		} else {
+			dvb_attach(tda18272_attach,
+				   dvb->fe,
+				   &saa7231->i2c[1 + frontend].i2c_adapter,
+				   &bgt3620_tda18272_config[frontend]);
+		}
+		ret = 0;
+		break;
+	case SUBSYS_INFO(BLACKGOLD_TECHNOLOGY, BLACKGOLD_BGT3595):
+		dvb->fe = dvb_attach(stv090x_attach,
+				     &bgt3595_stv090x_config,
+				     &i2c_1->i2c_adapter,
+				     STV090x_DEMODULATOR_0 + frontend);
+
+		if (!dvb->fe) {
+			dprintk(SAA7231_ERROR, 1, "Frontend:%d attach failed", frontend);
+			ret = -ENODEV;
+			goto exit;
+		}
+		ctl = dvb_attach(stv6110x_attach,
+				 dvb->fe,
+				 &bgt3595_stv6110x_config,
+				 &i2c_1->i2c_adapter);
+
+		STV090x_CFGUPDATE(&bgt3595_stv090x_config, ctl);
+		if (dvb->fe->ops.init)
+			dvb->fe->ops.init(dvb->fe);
+
+		dvb_attach(lnbh24_attach,
+			   dvb->fe,
+			   &i2c_0->i2c_adapter,
+			   0,
+			   0,
+			   bgt3595_lnbh24_config[frontend]);
+		ret = 0;
+		break;
+	case SUBSYS_INFO(BLACKGOLD_TECHNOLOGY, BLACKGOLD_BGT3585):
+		i2c = &saa7231->i2c[frontend + 1];
+		dvb->fe = dvb_attach(tda10048_attach,
+				     &bgt3585_tda10048_config[frontend],
+				     &i2c->i2c_adapter);
+
+		if (!dvb->fe) {
+			dprintk(SAA7231_ERROR, 1, "Frontend:%d attach failed", frontend);
+			ret = -ENODEV;
+			goto exit;
+		}
+		dvb_attach(tda18271_attach,
+			   dvb->fe,
+			   0x60,
+			   &i2c->i2c_adapter,
+			   &bgt3585_tda18271_config);
+		ret = 0;
+		break;
+	case SUBSYS_INFO(BLACKGOLD_TECHNOLOGY, BLACKGOLD_BGT3576):
+		if (frontend == 0) {
+			dvb->fe = dvb_attach(s5h1411_attach,
+					     &bgt3576_s5h1411_config,
+					     &i2c_2->i2c_adapter);
+
+			if (!dvb->fe) {
+				dprintk(SAA7231_ERROR, 1, "Frontend:%d attach failed", frontend);
+				ret = -ENODEV;
+				goto exit;
+			}
+			dvb_attach(tda18271_attach,
+				   dvb->fe,
+				   (0xc0 >> 1),
+				   &i2c_2->i2c_adapter,
+				   &bgt3576_tda18271_config);
+		}
+		if (frontend == 1) {
+			dvb->fe = dvb_attach(stv090x_attach,
+					     &bgt3576_stv090x_config,
+					     &i2c_1->i2c_adapter,
+					     STV090x_DEMODULATOR_0);
+
+			if (!dvb->fe) {
+				dprintk(SAA7231_ERROR, 1, "Frontend:%d attach failed", frontend);
+				ret = -ENODEV;
+				goto exit;
+			}
+			ctl = dvb_attach(stv6110x_attach,
+					 dvb->fe,
+					 &bgt3576_stv6110x_config,
+					 &i2c_1->i2c_adapter);
+
+			if (!ctl) {
+				dprintk(SAA7231_ERROR, 1, "Frontend:%d attach failed", frontend);
+				ret = -ENODEV;
+				goto exit;
+			}
+			STV090x_CFGUPDATE(&bgt3576_stv090x_config, ctl);
+			if (dvb->fe->ops.init)
+				dvb->fe->ops.init(dvb->fe);
+
+			if (dvb_attach(lnbh24_attach,
+				dvb->fe,
+				&i2c_0->i2c_adapter,
+				0,
+				0,
+				bgt3576_lnbh23_config) == NULL) {
+
+				dprintk(SAA7231_ERROR, 1, "LNBH23 not found");
+				goto exit;
+			}
+		}
+		ret = 0;
+		break;
+	case SUBSYS_INFO(BLACKGOLD_TECHNOLOGY, BLACKGOLD_BGT3575):
+		if (frontend == 0) {
+			dvb->fe = dvb_attach(tda10048_attach,
+					     &bgt3575_tda10048_config,
+					     &i2c_2->i2c_adapter);
+
+			if (!dvb->fe) {
+				dprintk(SAA7231_ERROR, 1, "Frontend:%d attach failed", frontend);
+				ret = -ENODEV;
+				goto exit;
+			}
+			dvb_attach(tda18271_attach,
+				   dvb->fe,
+				   0x60,
+				   &i2c_2->i2c_adapter,
+				   &bgt3575_tda18271_config);
+		}
+		if (frontend == 1) {
+			dvb->fe = dvb_attach(stv090x_attach,
+					     &bgt3575_stv090x_config,
+					     &i2c_1->i2c_adapter,
+					     STV090x_DEMODULATOR_0);
+
+			if (!dvb->fe) {
+				dprintk(SAA7231_ERROR, 1, "Frontend:%d attach failed", frontend);
+				ret = -ENODEV;
+				goto exit;
+
+			}
+
+			ctl = dvb_attach(stv6110x_attach,
+					 dvb->fe,
+					 &bgt3575_stv6110x_config,
+					 &i2c_1->i2c_adapter);
+
+			if (!ctl) {
+				dprintk(SAA7231_ERROR, 1, "Frontend:%d attach failed", frontend);
+				ret = -ENODEV;
+				goto exit;
+			}
+			STV090x_CFGUPDATE(&bgt3575_stv090x_config, ctl);
+			if (dvb->fe->ops.init)
+				dvb->fe->ops.init(dvb->fe);
+
+			if (dvb_attach(lnbh24_attach,
+				       dvb->fe,
+				       &i2c_0->i2c_adapter,
+				       0,
+				       0,
+				       bgt3575_lnbh23_config) == NULL) {
+
+				dprintk(SAA7231_ERROR, 1, "LNBH23 not found");
+				goto exit;
+			}
+
+		}
+		ret = 0;
+		break;
+	case SUBSYS_INFO(NXP_REFERENCE_BOARD, PURUS_PCIe_REF):
+		break;
+	case SUBSYS_INFO(NXP_REFERENCE_BOARD, PURUS_mPCIe_REF):
+		dvb->fe = dvb_attach(s5h1411_attach,
+				     &purus_mpcie_s5h1411_config,
+				     &i2c_0->i2c_adapter);
+
+		if (!dvb->fe) {
+			dprintk(SAA7231_ERROR, 1, "Frontend:%d attach failed", frontend);
+			ret = -ENODEV;
+			goto exit;
+		}
+
+		dvb_attach(tda18271_attach,
+			   dvb->fe,
+			   0x60,
+			   &i2c_1->i2c_adapter,
+			   &purus_mpcie_tda18271_config);
+
+		ret = 0;
+		break;
+	}
+exit:
+	return ret;
+}
+#else
+static int saa7231_frontend_attach(struct saa7231_dvb *dvb, int frontend)
+{
+	struct saa7231_dev *saa7231	= dvb->saa7231;
+	struct pci_dev *pdev		= saa7231->pdev;
+	u32 subsystem_info		= SUBSYS_INFO(pdev->subsystem_vendor, pdev->subsystem_device);
+	int ret = 0;
+
+	dprintk(SAA7231_DEBUG, 1, "Frontend Init Adapter (%d) Device ID=%02x",
+		frontend, pdev->subsystem_device);
+
+	switch (subsystem_info) {
+	case SUBSYS_INFO(AVERMEDIA_TECHNOLOGY, AVERMEDIA_A328_DTMB):
+		/* AVerMedia A328 Pure DTMB
+		 *   demod : LGS8G75  @ i2c-0 (bus 8)  addr 0x21
+		 *   tuner : TDA18271HD/C2 @ i2c-2 (bus 10) addr 0x60
+		 *   IF    : 4.57 MHz (AVer7231_A328_Pure_DTMB.inf) */
+		if (frontend != 0)
+			break;
+
+		/* === LGS8G75 硬件复位脉冲 (GPIO bit via a328_gpio_reset) === */
+		/* GPIO 0-7 已在 saa7231_frontend_enable() 设为输出高电平，
+		 * 这里先拉低复位引脚再拉高，复位 LGS8G75 让 8051 从干净态启动。
+		 * a328_gpio_reset: 0..7 = GPIO bit, -1 = skip, default 0 */
+		if (a328_gpio_reset >= 0 && a328_gpio_reset <= 7) {
+			u32 rst_bit = 1u << a328_gpio_reset;
+			saa7231_gpio_set(saa7231, rst_bit, 0);	/* 拉低复位 */
+			msleep(20);				/* 保持至少 10ms */
+			saa7231_gpio_set(saa7231, rst_bit, 1);	/* 释放复位 */
+			msleep(100);				/* 等待 8051 启动 */
+			dev_info(&pdev->dev, "A328: LGS8G75 hardware reset done (GPIO%d pulse)", a328_gpio_reset);
+		} else {
+			dev_info(&pdev->dev, "A328: LGS8G75 hardware reset skipped (a328_gpio_reset=%d)", a328_gpio_reset);
+		}
+
+		a328_lgs8g75_config.if_clk_freq = a328_if_clk;
+		a328_lgs8g75_config.if_neg_center = a328_if_neg_center;
+		a328_lgs8g75_config.if_neg_edge = a328_if_neg_edge;
+		a328_lgs8g75_config.adc_signed = a328_adc_signed;
+		a328_lgs8g75_config.adc_vpp = a328_adc_vpp;
+		dprintk(SAA7231_INFO, 1,
+			"A328: LGS8G75 if_clk=%d ifnegc=%d ifnege=%d adcsgn=%d vpp=%d",
+			a328_if_clk, a328_if_neg_center, a328_if_neg_edge,
+			a328_adc_signed, a328_adc_vpp);
+		dvb->fe = dvb_attach(lgs8gxx_attach, &a328_lgs8g75_config,
+				     &saa7231->i2c[0].i2c_adapter);
+		if (!dvb->fe) {
+			dprintk(SAA7231_ERROR, 1, "A328: LGS8G75 attach failed (i2c-0:0x21)");
+			ret = -ENODEV;
+			goto exit;
+		}
+
+		if (!dvb_attach(tda18271_attach, dvb->fe, 0x60,
+				&saa7231->i2c[2].i2c_adapter,
+				&a328_tda18271_config)) {
+			dprintk(SAA7231_ERROR, 1, "A328: TDA18271 attach failed (i2c-2:0x60)");
+			ret = -ENODEV;
+			goto exit;
+		}
+
+		/* tda18271 set_params() rejects SYS_DTMB (-EINVAL).  AVerMedia's
+		 * Windows driver tunes DTMB through the tuner's DVB-T 8 MHz mode
+		 * (INF: TDA18271_DVBT_IF_FREQ_8M = 4570000,
+		 *  TDA18271_DVBT_8M_STD = 0x19, IFLevel_DVBT = 7), so wrap
+		 * set_params and rewrite the delivery system on the fly. */
+		if (dvb->fe->ops.tuner_ops.set_params) {
+			a328_tuner_set_params_orig = dvb->fe->ops.tuner_ops.set_params;
+			dvb->fe->ops.tuner_ops.set_params = a328_tuner_set_params;
+		}
+
+		/* MSCD clock outputs are gated by the NXP cgu_init (CLOCK_ENABLE=0
+		 * macro semantics are inverted vs the A328 hardware, where bit0=1
+		 * means enable - Windows reads 0x081D there).  Wrap set_frontend
+		 * so a328_mscd_clk_on() turns on the 10 safe clock outputs
+		 * (0x58..0x7C) at TUNE time, before the LGS8G75 demod is touched.
+		 * NOT written at attach: clock-out writes in probe/attach state
+		 * made the SAA7231 vanish from the PCI bus; tune-time writes are
+		 * safe (validated via reg_write sysfs). */
+		if (dvb->fe->ops.set_frontend) {
+			a328_set_frontend_orig = dvb->fe->ops.set_frontend;
+			dvb->fe->ops.set_frontend = a328_set_frontend;
+			dev_info(&pdev->dev,
+				 "A328: mounted a328_set_frontend wrapper (orig=%ps)\n",
+				 a328_set_frontend_orig);
+		} else {
+			dev_info(&pdev->dev,
+				 "A328: WARNING fe->ops.set_frontend is NULL!\n");
+		}
+		dprintk(SAA7231_INFO, 1, "A328: LGS8G75 + TDA18271 frontend attached");
+		break;
+	case SUBSYS_INFO(YUAN_TECHNOLOGY, YUAN_MC163ML):
+		/* Yuan MC163ML: Realtek RTL2836B DTMB demod @ i2c-0:0x21 (bus 12)
+		 * + tuner @ i2c-1:0x60 (bus 13, appears after GPIO power-up).
+		 * Mounted via our rtl2836 driver (real DTMB demod, ported from
+		 * the Realtek SDK). Tuner identification still pending. */
+		if (frontend != 0)
+			break;
+
+		dvb->fe = dvb_attach(rtl2836_attach, &yuan_rtl2836_cfg,
+				     &saa7231->i2c[0].i2c_adapter);
+		if (!dvb->fe) {
+			dprintk(SAA7231_ERROR, 1,
+				"YUAN: rtl2836 attach failed (i2c-0:0x21)");
+			ret = -ENODEV;
+			goto exit;
+		}
+		dprintk(SAA7231_INFO, 1, "YUAN: RTL2836B (rtl2836) frontend attached");
+
+		/* tuner @ i2c-1:0x60 - identity TBD. DISABLED for now: the
+		 * MT2063 probe dead-locked the SAA7231 I2C controller while
+		 * TVH enumerated the frontend (all 8 buses went dark). Keep
+		 * the demod mounted only until the real tuner is identified
+		 * (suspect ADMTV series per MyGica D690 reference). */
+		dprintk(SAA7231_INFO, 1,
+			"YUAN: tuner not mounted (I2C deadlock risk), demod only");
+		break;
+	default:
+		break;
+	}
+exit:
+	return ret;
+}
+#endif
+
+static struct saa7231_config purus_blackgold_bgt3636 = {
+	.desc			= DEVICE_DESC(BGT3636),
+	.xtal			= 54,
+	.i2c_rate		= SAA7231_I2C_RATE_400,
+	.root_clk		= CLK_ROOT_54MHz,
+	.irq_handler		= saa7231_irq_handler,
+
+	.ext_dvb_adapters	= 2,
+	.ts0_cfg		= 0x41,
+	.ts0_clk		= 0x05,
+	.ts1_cfg		= 0x41,
+	.ts1_clk		= 0x05,
+
+	.frontend_enable	= saa7231_frontend_enable,
+	.frontend_attach	= saa7231_frontend_attach,
+
+	.stream_ports		= 2,
+};
+
+static struct saa7231_config purus_blackgold_bgt3630 = {
+	.desc			= DEVICE_DESC(BGT3630),
+	.xtal			= 54,
+	.i2c_rate		= SAA7231_I2C_RATE_100,
+	.root_clk		= CLK_ROOT_54MHz,
+	.irq_handler		= saa7231_irq_handler,
+
+	.ext_dvb_adapters	= 2,
+	.ts0_cfg		= 0x41,
+	.ts0_clk		= 0x01,
+	.ts1_cfg		= 0x41,
+	.ts1_clk		= 0x05,
+
+	.frontend_enable	= saa7231_frontend_enable,
+	.frontend_attach	= saa7231_frontend_attach,
+
+	.stream_ports		= 2,
+};
+
+static struct saa7231_config purus_blackgold_bgt3600 = {
+	.desc			= DEVICE_DESC(BGT3600),
+
+	.xtal			= 54,
+	.i2c_rate		= SAA7231_I2C_RATE_100,
+	.root_clk		= CLK_ROOT_54MHz,
+	.irq_handler		= saa7231_irq_handler,
+
+	.ext_dvb_adapters	= 2,
+	.ts0_cfg		= 0x41,
+	.ts0_clk		= 0x05,
+	.ts1_cfg		= 0x41,
+	.ts1_clk		= 0x05,
+	.frontend_enable	= saa7231_frontend_enable,
+	.frontend_attach	= saa7231_frontend_attach,
+
+	.stream_ports		= 2,
+};
+
+static struct saa7231_config purus_blackgold_bgt3651 = {
+	.desc			= DEVICE_DESC(BGT3651),
+
+	.xtal			= 54,
+	.i2c_rate		= SAA7231_I2C_RATE_100,
+	.root_clk		= CLK_ROOT_54MHz,
+	.irq_handler		= saa7231_irq_handler,
+
+	.ext_dvb_adapters	= 2,
+	.ts0_cfg		= 0x41,
+	.ts0_clk		= 0x01,
+	.ts1_cfg		= 0x41,
+	.ts1_clk		= 0x01,
+	.frontend_enable	= saa7231_frontend_enable,
+	.frontend_attach	= saa7231_frontend_attach,
+
+	.stream_ports		= 2,
+};
+
+static struct saa7231_config purus_blackgold_bgt3650 = {
+	.desc			= DEVICE_DESC(BGT3650),
+
+	.xtal			= 54,
+	.i2c_rate		= SAA7231_I2C_RATE_100,
+	.root_clk		= CLK_ROOT_54MHz,
+	.irq_handler		= saa7231_irq_handler,
+
+	.ext_dvb_adapters	= 2,
+	.ts0_cfg		= 0x41,
+	.ts0_clk		= 0x01,
+	.ts1_cfg		= 0x41,
+	.ts1_clk		= 0x01,
+	.frontend_enable	= saa7231_frontend_enable,
+	.frontend_attach	= saa7231_frontend_attach,
+
+	.stream_ports		= 2,
+};
+
+static struct saa7231_config purus_blackgold_bgt3602 = {
+	.desc			= DEVICE_DESC(BGT3602),
+
+	.xtal			= 54,
+	.i2c_rate		= SAA7231_I2C_RATE_100,
+	.root_clk		= CLK_ROOT_54MHz,
+	.irq_handler		= saa7231_irq_handler,
+
+	.ext_dvb_adapters	= 2,
+	.ts0_cfg		= 0x41,
+	.ts0_clk		= 0x01,
+	.ts1_cfg		= 0x41,
+	.ts1_clk		= 0x01,
+	.frontend_enable	= saa7231_frontend_enable,
+	.frontend_attach	= saa7231_frontend_attach,
+
+	.stream_ports		= 2,
+};
+
+static struct saa7231_config purus_blackgold_bgt3620 = {
+	.desc			= DEVICE_DESC(BGT3620),
+
+	.xtal			= 54,
+	.i2c_rate		= SAA7231_I2C_RATE_100,
+	.root_clk		= CLK_ROOT_54MHz,
+	.irq_handler		= saa7231_irq_handler,
+
+	.ext_dvb_adapters	= 2,
+	.ts0_cfg		= 0x41,
+	.ts0_clk		= 0x01,
+	.ts1_cfg		= 0x41,
+	.ts1_clk		= 0x01,
+	.frontend_enable	= saa7231_frontend_enable,
+	.frontend_attach	= saa7231_frontend_attach,
+
+	.stream_ports		= 2,
+};
+
+static struct saa7231_config purus_blackgold_bgt3595 = {
+
+	.desc			= DEVICE_DESC(BGT3595),
+
+	.xtal			= 54,
+	.i2c_rate		= SAA7231_I2C_RATE_100,
+	.root_clk		= CLK_ROOT_54MHz,
+	.irq_handler		= saa7231_irq_handler,
+
+	.ext_dvb_adapters	= 2,
+	.ts0_cfg		= 0x41,
+	.ts0_clk		= 0x07,
+	.ts1_cfg		= 0x41,
+	.ts1_clk		= 0x07,
+	.frontend_enable	= saa7231_frontend_enable,
+	.frontend_attach	= saa7231_frontend_attach,
+
+	.stream_ports		= 2,
+};
+
+static struct saa7231_config purus_blackgold_bgt3585 = {
+
+	.desc			= DEVICE_DESC(BGT3585),
+
+	.xtal			= 54,
+	.i2c_rate		= SAA7231_I2C_RATE_400,
+	.root_clk		= CLK_ROOT_54MHz,
+	.irq_handler		= saa7231_irq_handler,
+
+	.ext_dvb_adapters	= 2,
+	.ts0_cfg		= 0x41,
+	.ts0_clk		= 0x01,
+	.ts1_cfg		= 0x41,
+	.ts1_clk		= 0x01,
+	.frontend_enable	= saa7231_frontend_enable,
+	.frontend_attach	= saa7231_frontend_attach,
+
+	.stream_ports		= 2,
+};
+
+static struct saa7231_config purus_blackgold_bgt3576 = {
+
+	.desc			= DEVICE_DESC(BGT3576),
+
+	.xtal			= 54,
+	.i2c_rate		= SAA7231_I2C_RATE_400,
+	.root_clk		= CLK_ROOT_54MHz,
+	.irq_handler		= saa7231_irq_handler,
+
+	.ext_dvb_adapters	= 2,
+	.ts0_cfg		= 0x41,
+	.ts0_clk		= 0x01,
+	.ts1_cfg		= 0x41,
+	.ts1_clk		= 0x07,
+	.frontend_enable	= saa7231_frontend_enable,
+	.frontend_attach	= saa7231_frontend_attach,
+	.stream_ports		= 2,
+};
+
+static struct saa7231_config purus_blackgold_bgt3575 = {
+
+	.desc			= DEVICE_DESC(BGT3575),
+
+	.xtal			= 54,
+	.i2c_rate		= SAA7231_I2C_RATE_100,
+	.root_clk		= CLK_ROOT_54MHz,
+	.irq_handler		= saa7231_irq_handler,
+
+	.ext_dvb_adapters	= 2,
+	.ts0_cfg		= 0x41,
+	.ts0_clk		= 0x01,
+	.ts1_cfg		= 0x41,
+	.ts1_clk		= 0x07,
+	.frontend_enable	= saa7231_frontend_enable,
+	.frontend_attach	= saa7231_frontend_attach,
+	.stream_ports		= 2,
+};
+static struct saa7231_config purus_pcie_ref_config = {
+
+	.desc			= DEVICE_DESC(PURUS_PCIE),
+
+	.a_tvc			= 1,
+	.v_cap			= 1,
+	.a_cap			= 1,
+
+	.xtal			= 54,
+	.i2c_rate		= SAA7231_I2C_RATE_100,
+	.root_clk		= CLK_ROOT_54MHz,
+	.irq_handler		= saa7231_irq_handler,
+
+	.frontend_enable	= saa7231_frontend_enable,
+	.frontend_attach	= saa7231_frontend_attach,
+	.stream_ports		= 2,
+};
+
+static struct saa7231_config purus_mpcie_ref_config = {
+
+	.desc			= DEVICE_DESC(PURUS_MPCIE),
+
+	.a_tvc			= 1,
+	.v_cap			= 1,
+	.a_cap			= 1,
+
+	.xtal			= 54,
+	.i2c_rate		= SAA7231_I2C_RATE_100,
+	.root_clk		= CLK_ROOT_54MHz,
+	.irq_handler		= saa7231_irq_handler,
+
+	.ext_dvb_adapters	= 1,
+	.ts0_cfg		= 0x11,
+	.frontend_enable	= saa7231_frontend_enable,
+	.frontend_attach	= saa7231_frontend_attach,
+	.stream_ports		= 1,
+};
+
+static struct pci_device_id saa7231_pci_table[] = {
+
+	MAKE_ENTRY(BLACKGOLD_TECHNOLOGY, BLACKGOLD_BGT3575, SAA7231, &purus_blackgold_bgt3575),
+	MAKE_ENTRY(BLACKGOLD_TECHNOLOGY, BLACKGOLD_BGT3576, SAA7231, &purus_blackgold_bgt3576),
+	MAKE_ENTRY(BLACKGOLD_TECHNOLOGY, BLACKGOLD_BGT3585, SAA7231, &purus_blackgold_bgt3585),
+	MAKE_ENTRY(BLACKGOLD_TECHNOLOGY, BLACKGOLD_BGT3595, SAA7231, &purus_blackgold_bgt3595),
+
+	MAKE_ENTRY(BLACKGOLD_TECHNOLOGY, BLACKGOLD_BGT3600, SAA7231, &purus_blackgold_bgt3600),
+	MAKE_ENTRY(BLACKGOLD_TECHNOLOGY, BLACKGOLD_BGT3600, SAA7231, &purus_blackgold_bgt3602),
+	MAKE_ENTRY(BLACKGOLD_TECHNOLOGY, BLACKGOLD_BGT3620, SAA7231, &purus_blackgold_bgt3620),
+	MAKE_ENTRY(BLACKGOLD_TECHNOLOGY, BLACKGOLD_BGT3630, SAA7231, &purus_blackgold_bgt3630),
+	MAKE_ENTRY(BLACKGOLD_TECHNOLOGY, BLACKGOLD_BGT3650, SAA7231, &purus_blackgold_bgt3650),
+	MAKE_ENTRY(BLACKGOLD_TECHNOLOGY, BLACKGOLD_BGT3651, SAA7231, &purus_blackgold_bgt3651),
+	MAKE_ENTRY(BLACKGOLD_TECHNOLOGY, BLACKGOLD_BGT3636, SAA7231, &purus_blackgold_bgt3636),
+
+	MAKE_ENTRY(AVERMEDIA_TECHNOLOGY, AVERMEDIA_A328_DTMB, SAA7231, &avermedia_a328_dtmb),
+	MAKE_ENTRY(YUAN_TECHNOLOGY, YUAN_MC163ML, SAA7231, &yuan_mc163ml),
+
+	MAKE_ENTRY(SUBVENDOR_ALL, SUBDEVICE_ALL, SAA7231, &purus_blackgold_bgt3576),
+	MAKE_ENTRY(SUBVENDOR_ALL, SUBDEVICE_ALL, SAA7231, &purus_blackgold_bgt3575),
+
+	MAKE_ENTRY(NXP_REFERENCE_BOARD, PURUS_mPCIe_REF, SAA7231, &purus_mpcie_ref_config),
+	MAKE_ENTRY(NXP_REFERENCE_BOARD, PURUS_PCIe_REF, SAA7231, &purus_pcie_ref_config),
+	{ }
+};
+MODULE_DEVICE_TABLE(pci, saa7231_pci_table);
+
+static struct pci_driver saa7231_pci_driver = {
+	.name			= DRIVER_NAME,
+	.id_table		= saa7231_pci_table,
+	.probe			= saa7231_pci_probe,
+	.remove			= saa7231_pci_remove,
+};
+
+static int saa7231_init(void)
+{
+	return pci_register_driver(&saa7231_pci_driver);
+}
+
+static void saa7231_exit(void)
+{
+	return pci_unregister_driver(&saa7231_pci_driver);
+}
+
+module_init(saa7231_init);
+module_exit(saa7231_exit);
+
+MODULE_DESCRIPTION("SAA7231 driver");
+MODULE_AUTHOR("Manu Abraham");
+MODULE_LICENSE("GPL");
+

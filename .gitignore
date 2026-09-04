@@ -1,0 +1,15 @@
+# 内核模块编译产物
+*.o
+*.ko
+*.mod
+*.mod.c
+Module.symvers
+modules.order
+.tmp_versions/
+*.cmd
+
+# 编辑器/系统
+.vscode/
+*.swp
+*~
+.DS_Store
